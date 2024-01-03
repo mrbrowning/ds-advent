@@ -1,8 +1,12 @@
 use core::fmt;
 use std::io;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use thiserror;
+
+use crate::types::JSONMap;
+
+const ERROR_MSG_TYPE: &str = "error";
 
 #[derive(thiserror::Error, Debug)]
 pub enum MaelstromError {
@@ -45,7 +49,10 @@ impl TryFrom<i64> for ErrorType {
             21 => Ok(Self::KeyAlreadyExists),
             22 => Ok(Self::PreconditionFailed),
             30 => Ok(Self::TxnConflict),
-            _ => Err(MaelstromError::Other(format!("Can't cast {} to ErrorType, no matching code", value))),
+            _ => Err(MaelstromError::Other(format!(
+                "Can't cast {} to ErrorType, no matching code",
+                value
+            ))),
         }
     }
 }
@@ -75,31 +82,41 @@ impl RPCError {
     pub fn error_code(&self) -> i64 {
         self.code
     }
-    
+
     pub fn message(&self) -> &str {
         &self.text
     }
-    
+
     pub fn error_code_text(code: i64) -> String {
         if let Ok(err_type) = ErrorType::try_from(code) {
-            return format!("{:?}", err_type);            
+            return format!("{:?}", err_type);
         }
-        
+
         format!("ErrorCode<{}>", code)
     }
 }
 
 impl fmt::Display for RPCError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "RPCError({}, \"{}\")", RPCError::error_code_text(self.code), self.text)
+        write!(
+            f,
+            "RPCError({}, \"{}\")",
+            RPCError::error_code_text(self.code),
+            self.text
+        )
     }
 }
 
 impl Serialize for RPCError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer {
-        let rpc_err_json = RPCErrorJSON { msg_type: "error".to_string(), code: self.code, text: self.text.clone() };
+        S: serde::Serializer,
+    {
+        let rpc_err_json = RPCErrorJSON {
+            msg_type: ERROR_MSG_TYPE.to_string(),
+            code: self.code,
+            text: self.text.clone(),
+        };
         rpc_err_json.serialize(serializer)
     }
 }
@@ -107,13 +124,25 @@ impl Serialize for RPCError {
 impl<'de> Deserialize<'de> for RPCError {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de> {
+        D: serde::Deserializer<'de>,
+    {
         let rpc_err_json = RPCErrorJSON::deserialize(deserializer)?;
 
         Ok(RPCError {
             code: rpc_err_json.code,
             text: rpc_err_json.text,
         })
+    }
+}
+
+impl From<RPCError> for JSONMap {
+    fn from(value: RPCError) -> Self {
+        let mut map = JSONMap::new();
+        map.insert("type".to_string(), serde_json::Value::from(ERROR_MSG_TYPE));
+        map.insert("code".to_string(), serde_json::Value::from(value.code));
+        map.insert("text".to_string(), serde_json::Value::from(value.text));
+
+        map
     }
 }
 
@@ -126,7 +155,10 @@ mod tests {
         let test_vals = vec![
             (ErrorType::Timeout as i64, "Timeout"),
             (ErrorType::NotSupported as i64, "NotSupported"),
-            (ErrorType::TemporarilyUnavailable as i64, "TemporarilyUnavailable"),
+            (
+                ErrorType::TemporarilyUnavailable as i64,
+                "TemporarilyUnavailable",
+            ),
             (ErrorType::MalformedRequest as i64, "MalformedRequest"),
             (ErrorType::Crash as i64, "Crash"),
             (ErrorType::Abort as i64, "Abort"),
@@ -141,9 +173,12 @@ mod tests {
             assert_eq!(code_str, RPCError::error_code_text(code));
         }
     }
-    
+
     #[test]
     fn test_rpc_error_display() {
-        assert_eq!(format!("{}", RPCError::new(ErrorType::Crash as i64, "foo")), "RPCError(Crash, \"foo\")");
+        assert_eq!(
+            format!("{}", RPCError::new(ErrorType::Crash as i64, "foo")),
+            "RPCError(Crash, \"foo\")"
+        );
     }
 }

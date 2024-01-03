@@ -1,4 +1,4 @@
 [workspace]
 
-members = ["maelstrom", "advent"]
+members = ["maelstrom", "challenge0"]
 resolver = "2"
