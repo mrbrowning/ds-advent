@@ -85,10 +85,12 @@ impl Generator {
         sequence_id
     }
 
+    #[cfg(test)]
     fn peek_sequence_id(&self) -> u64 {
         self.sequence_id
     }
 
+    #[cfg(test)]
     fn node_id(&self) -> u64 {
         self.node_id
     }
