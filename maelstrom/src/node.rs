@@ -9,7 +9,7 @@ use futures::{future::BoxFuture, FutureExt};
 use log::{error, info};
 use serde::{de, Deserialize, Serialize};
 use tokio::{
-    io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Stdin},
+    io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     sync::mpsc::unbounded_channel,
     task::JoinSet,
 };
@@ -199,12 +199,11 @@ impl From<InitMessageBody> for JSONMap {
     }
 }
 
-type NodeCallback<R> = dyn FnOnce(&Node<Initialized, R>, Message) -> BoxFuture<'_, Result<(), MaelstromError>>
+type NodeCallback = dyn FnOnce(&Node<Initialized>, Message) -> BoxFuture<'_, Result<(), MaelstromError>>
     + Send
     + Sync;
-pub type NodeHandler<R> = dyn Fn(&Node<Initialized, R>, Message) -> BoxFuture<'_, Result<(), MaelstromError>>
-    + Send
-    + Sync;
+pub type NodeHandler =
+    dyn Fn(&Node<Initialized>, Message) -> BoxFuture<'_, Result<(), MaelstromError>> + Send + Sync;
 
 #[derive(Debug)]
 pub struct Uninitialized {}
@@ -219,20 +218,18 @@ pub trait NodeState {}
 impl NodeState for Uninitialized {}
 impl NodeState for Initialized {}
 
-pub struct Node<S: NodeState, R: AsyncBufRead + Send + Unpin + 'static> {
+pub struct Node<S: NodeState> {
     state: S,
     next_msg_id: Arc<Mutex<i64>>,
 
-    handlers: Arc<tokio::sync::Mutex<HashMap<String, Arc<NodeHandler<R>>>>>,
-    callbacks: Arc<Mutex<HashMap<i64, Box<NodeCallback<R>>>>>,
+    handlers: Arc<tokio::sync::Mutex<HashMap<String, Arc<NodeHandler>>>>,
+    callbacks: Arc<Mutex<HashMap<i64, Box<NodeCallback>>>>,
 
-    stdin: Arc<tokio::sync::Mutex<R>>,
+    stdin: Arc<tokio::sync::Mutex<dyn AsyncBufRead + Send + Unpin>>,
     stdout: Arc<tokio::sync::Mutex<dyn AsyncWrite + Send + Unpin>>,
 }
 
-impl<S: NodeState + std::fmt::Debug, R: AsyncBufRead + Send + Unpin> std::fmt::Debug
-    for Node<S, R>
-{
+impl<S: NodeState + std::fmt::Debug> std::fmt::Debug for Node<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Node")
             .field("state", &self.state)
@@ -241,8 +238,8 @@ impl<S: NodeState + std::fmt::Debug, R: AsyncBufRead + Send + Unpin> std::fmt::D
     }
 }
 
-impl<S: NodeState, R: AsyncBufRead + Send + Unpin> Node<S, R> {
-    pub async fn handle(&self, handler_type: impl Into<String>, handler_fn: Arc<NodeHandler<R>>) {
+impl<S: NodeState> Node<S> {
+    pub async fn handle(&self, handler_type: impl Into<String>, handler_fn: Arc<NodeHandler>) {
         let mut handlers = self.handlers.lock().await;
         let handler_type_str = handler_type.into();
         if handlers.get(&handler_type_str).is_some() {
@@ -256,8 +253,11 @@ impl<S: NodeState, R: AsyncBufRead + Send + Unpin> Node<S, R> {
     }
 }
 
-impl<R: AsyncBufRead + Send + Unpin> Node<Uninitialized, R> {
-    pub fn new(stdin: R, stdout: impl AsyncWrite + Send + Unpin + 'static) -> Self {
+impl Node<Uninitialized> {
+    pub fn new(
+        stdin: impl AsyncBufRead + Send + Unpin + 'static,
+        stdout: impl AsyncWrite + Send + Unpin + 'static,
+    ) -> Self {
         Node {
             state: Uninitialized {},
             next_msg_id: Arc::new(Mutex::new(0)),
@@ -270,7 +270,7 @@ impl<R: AsyncBufRead + Send + Unpin> Node<Uninitialized, R> {
         }
     }
 
-    pub fn init(self, id: String, node_ids: Vec<String>) -> Node<Initialized, R> {
+    pub fn init(self, id: String, node_ids: Vec<String>) -> Node<Initialized> {
         Node {
             state: Initialized { id, node_ids },
             next_msg_id: self.next_msg_id,
@@ -283,10 +283,7 @@ impl<R: AsyncBufRead + Send + Unpin> Node<Uninitialized, R> {
         }
     }
 
-    async fn handle_init_message(
-        self,
-        msg: Message,
-    ) -> Result<Node<Initialized, R>, MaelstromError> {
+    async fn handle_init_message(self, msg: Message) -> Result<Node<Initialized>, MaelstromError> {
         let body: InitMessageBody = InitMessageBody::try_from(msg.body.clone())?;
         let node = self.init(body.node_id, body.node_ids);
 
@@ -310,7 +307,7 @@ impl<R: AsyncBufRead + Send + Unpin> Node<Uninitialized, R> {
         Ok(node)
     }
 
-    pub async fn run_init(self) -> Result<Node<Initialized, R>, MaelstromError> {
+    pub async fn run_init(self) -> Result<Node<Initialized>, MaelstromError> {
         let this = Arc::new(self);
         let mut stdin = this.stdin.lock().await;
 
@@ -350,13 +347,13 @@ impl<R: AsyncBufRead + Send + Unpin> Node<Uninitialized, R> {
     }
 }
 
-impl Node<Uninitialized, BufReader<Stdin>> {
+impl Node<Uninitialized> {
     pub fn default() -> Self {
         Self::new(BufReader::new(io::stdin()), io::stdout())
     }
 }
 
-impl<R: AsyncBufRead + Send + Unpin> Node<Initialized, R> {
+impl Node<Initialized> {
     pub fn id(&self) -> &str {
         &self.state.id
     }
@@ -377,13 +374,13 @@ impl<R: AsyncBufRead + Send + Unpin> Node<Initialized, R> {
         self.log_err_and_reply(msg, wrapped).await;
     }
 
-    async fn handle_callback(&self, handler: Box<NodeCallback<R>>, msg: Message) {
+    async fn handle_callback(&self, handler: Box<NodeCallback>, msg: Message) {
         if let Err(e) = handler(self, msg).await {
             error!("callback error: {}", e);
         }
     }
 
-    async fn handle_message(&self, handler: impl Deref<Target = NodeHandler<R>>, msg: Message) {
+    async fn handle_message(&self, handler: impl Deref<Target = NodeHandler>, msg: Message) {
         if let Err(e) = handler(self, msg.clone()).await {
             match e {
                 MaelstromError::RPCError(rpc_error) => {
@@ -446,7 +443,7 @@ impl<R: AsyncBufRead + Send + Unpin> Node<Initialized, R> {
         &self,
         dest: impl AsRef<str>,
         body: impl Serialize,
-        handler: Box<NodeCallback<R>>,
+        handler: Box<NodeCallback>,
     ) -> Result<(), MaelstromError> {
         let msg_id;
         {
@@ -657,7 +654,7 @@ mod tests {
     }
 
     fn new_node() -> (
-        Node<Uninitialized, BufReader<AsyncChannelReader>>,
+        Node<Uninitialized>,
         mpsc::Sender<String>,
         mpsc::Receiver<String>,
     ) {
@@ -673,7 +670,7 @@ mod tests {
     async fn test_node_rejects_malformed_json() {
         let input = "\n".as_bytes();
         let output: Vec<u8> = vec![];
-        let node: Node<Uninitialized, _> = Node::new(input, output);
+        let node: Node<Uninitialized> = Node::new(input, output);
 
         let result = node.run_init().await;
         if let Err(e) = result {
