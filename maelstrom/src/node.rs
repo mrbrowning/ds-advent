@@ -164,11 +164,11 @@ impl<'de> Deserialize<'de> for MessageBody {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct InitMessageBody {
+pub struct InitMessageBody {
     #[serde(flatten)]
-    message: MessageBody,
-    node_id: String,
-    node_ids: Vec<String>,
+    pub message: MessageBody,
+    pub node_id: String,
+    pub node_ids: Vec<String>,
 }
 
 impl TryFrom<JSONMap> for InitMessageBody {
