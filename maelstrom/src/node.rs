@@ -445,16 +445,16 @@ impl Node<Initialized> {
         body: impl Serialize,
         handler: Box<NodeCallback>,
     ) -> Result<(), MaelstromError> {
-        let msg_id;
-        {
+        let msg_id = {
             // These scopes are to prevent lock being held over await below, as a drop() doesn't convince the compiler.
             let mut next_msg_id = self
                 .next_msg_id
                 .lock()
                 .expect("next_msg_id lock was poisoned in rpc()");
             *next_msg_id += 1;
-            msg_id = *next_msg_id;
-        }
+
+            *next_msg_id
+        };
 
         {
             let mut callbacks = self
@@ -520,14 +520,13 @@ impl Node<Initialized> {
             info!("Received {:?}", msg);
 
             if let Some(in_reply_to) = body.in_reply_to {
-                let handler;
-                {
+                let handler = {
                     let mut callbacks = this
                         .callbacks
                         .lock()
                         .expect("callbacks lock was poisoned in run()");
-                    handler = callbacks.remove(&in_reply_to);
-                }
+                    callbacks.remove(&in_reply_to)
+                };
 
                 if handler.is_none() {
                     info!("Ignoring reply to {} with no callback", in_reply_to);
