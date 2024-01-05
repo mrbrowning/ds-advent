@@ -10,7 +10,7 @@ use log::{error, info};
 use serde::{de, Deserialize, Serialize};
 use tokio::{
     io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    sync::mpsc::unbounded_channel,
+    sync::oneshot,
     task::JoinSet,
 };
 
@@ -476,21 +476,22 @@ impl Node<Initialized> {
         dest: impl AsRef<str>,
         body: impl Serialize,
     ) -> Result<Message, MaelstromError> {
-        let (tx, mut rx) = unbounded_channel::<Message>();
+        let (tx, rx) = oneshot::channel::<Message>();
         self.rpc(
             dest,
             body,
             Box::new(move |_, msg| {
-                immediate!(tx
-                    .send(msg)
-                    .map_err(|e| MaelstromError::Other(format!("{}", e))))
+                immediate!(tx.send(msg).map_err(|m| MaelstromError::Other(format!(
+                    "oneshot send failed in sync_rpc() for message: {:?}",
+                    m
+                ))))
             }),
         )
         .await?;
 
-        let msg_result = rx.recv().await;
-        if msg_result.is_none() {
-            return Err(MaelstromError::Other("Sender dropped".to_string()));
+        let msg_result = rx.await;
+        if let Err(e) = msg_result {
+            return Err(MaelstromError::Other(format!("Sender dropped: {}", e)));
         }
         let msg = msg_result.unwrap();
         if let Some(e) = msg.rpc_error() {
