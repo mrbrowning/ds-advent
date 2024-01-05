@@ -347,8 +347,8 @@ impl Node<Uninitialized> {
     }
 }
 
-impl Node<Uninitialized> {
-    pub fn default() -> Self {
+impl Default for Node<Uninitialized> {
+    fn default() -> Self {
         Self::new(BufReader::new(io::stdin()), io::stdout())
     }
 }
