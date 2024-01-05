@@ -566,7 +566,6 @@ impl Node<Initialized> {
             }
         }
         while let Some(_) = join_set.join_next().await {}
-        drop(stdin);
 
         Ok(())
     }
