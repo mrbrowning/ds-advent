@@ -21,6 +21,10 @@ pub trait NodeDelegate {
         msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
     ) -> Self;
 
+    fn on_start(&mut self) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send {
+        async { Ok(()) }
+    }
+
     fn handle_reply(
         &mut self,
         reply: Message<Self::MessageType>,
@@ -99,6 +103,13 @@ pub trait NodeDelegate {
         Self: std::marker::Send,
     {
         async {
+            if let Err(e) = self.on_start().await {
+                match e {
+                    MaelstromError::ChannelError(_) => return Err(e),
+                    _ => (),
+                }
+            }
+
             let mut msg_rx = self.get_msg_rx();
             loop {
                 let msg = {
@@ -378,6 +389,26 @@ mod tests {
         sleep(Duration::from_millis(500)).await;
     }
 
+    #[tokio::test]
+    async fn test_delegate_runs_on_start() {
+        let (_ingress_tx, ingress_rx) = unbounded_channel::<Message<TestPayload>>();
+        let (egress_tx, mut egress_rx) = unbounded_channel::<Message<TestPayload>>();
+        let mut delegate = TestDelegate::init("", vec![], egress_tx, ingress_rx);
+
+        tokio::spawn(async move {
+            if let Err(e) = delegate.run().await {
+                panic!("Delegate died: {}", e);
+            }
+        });
+
+        if let Some(m) = egress_rx.recv().await {
+            assert_eq!(m.dest, Some("n1".into()));
+            assert_eq!(m.body.msg_id, Some(1));
+        } else {
+            panic!("Failed to receive on_start message from delegate");
+        }
+    }
+
     fn get_node_and_channels() -> (
         Node<TestPayload, TestDelegate>,
         UnboundedSender<Message<TestPayload>>,
@@ -439,6 +470,28 @@ mod tests {
             Self {
                 msg_tx,
                 msg_rx: Some(msg_rx),
+            }
+        }
+
+        fn on_start(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send {
+            async move {
+                let msg_tx = self.get_msg_tx();
+
+                let msg = Message {
+                    src: None,
+                    dest: Some("n1".into()),
+                    body: MessageBody {
+                        msg_id: Some(1),
+                        in_reply_to: None,
+                        local_msg: None,
+                        contents: TestPayload::Empty,
+                    },
+                };
+                send!(msg_tx, msg, "Delegate egress hung up: {}");
+
+                Ok(())
             }
         }
 
