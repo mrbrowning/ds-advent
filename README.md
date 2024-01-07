@@ -3,6 +3,10 @@ ds-advent
 
 A Rust client library for [Maelstrom](https://github.com/jepsen-io/maelstrom) and solutions for fly.io's set of [distributed systems challenges](https://fly.io/dist-sys/1/).
 
+## About the "About the Client Library" Below
+
+I was prepared for it to be a slightly gnarly interface to use in a Rust async context, but it was too gnarly, so I redid the client in exactly the way I proposed in the first paragraph. I know there are existing ones out there, but again, I thought it'd be a fun exercise itself. I'm pretty happy with it -- some of the type signatures are verbose, to put it lightly (though not as bad as they might ahave been without 1.75's inclusion of returning `impl Trait` in trait definitions), and I haven't yet come up with a nice way to not have to implement a method incrementing the `msg_id` for each new project, but it enables writing straightforward and simple code for the actual challenge logic, which seems like the mark of a successful library. It's a bit of overkill for echo, but the overhead is constant and gets amortized quickly as the inherent problem complexity grows.
+
 ## About the Client Library
 
 I thought it'd be an interesting, quick way to get my head in place to attempt a translation of fly.io's [Go client](https://pkg.go.dev/github.com/jepsen-io/maelstrom/demo/go) to Rust that maintained, as well as possible, the clear-box semantics of the Go library. That library is simple enough that a more idiomatic async implementation maintaining adherence to the Maelstrom protocol seems pretty straightforward -- CSP-style tasks owning resources like stdin/stdout that would otherwise be protected by locks (no tokio Mutex!) and communicating over channels, the Node equivalent handling only message ser/de and delegating behavior to a generic implementor, with that behavior being staticly dispatched instead of the dynamic handler registration of the Go lib -- so a superficially naive translation might make for a good learning experience.

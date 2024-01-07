@@ -87,6 +87,19 @@ dependencies = [
  "env_logger",
  "futures",
  "log",
+ "maelstrom_csp",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "challenge0_old"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "futures",
+ "log",
  "maelstrom",
  "serde_json",
  "tokio",
@@ -94,6 +107,20 @@ dependencies = [
 
 [[package]]
 name = "challenge1"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "futures",
+ "log",
+ "maelstrom_csp",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "challenge1_old"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -281,6 +308,20 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "maelstrom_csp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "trait-variant",
 ]
 
 [[package]]
@@ -499,6 +540,17 @@ name = "tokio-macros"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b8a1e28f2deaa14e508979454cb3a223b10b938b45af148bc0986de36f1923b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "trait-variant"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45e1a477061e97925d81a2f89fb73b2b8038e6baa5a0023bad380ac23b5f4fa6"
 dependencies = [
  "proc-macro2",
  "quote",
