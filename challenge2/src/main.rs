@@ -1,9 +1,13 @@
 #![allow(unused)]
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+};
 
-use log::{error, info};
+use log::error;
 use maelstrom_csp::{
+    get_node_and_io,
     message::{ErrorMessagePayload, InitMessagePayload, Message, MessageBody, MessagePayload},
     node::NodeDelegate,
     rpc_error::MaelstromError,
@@ -74,6 +78,8 @@ impl MessagePayload for BroadcastPayload {
     }
 }
 
+type BroadcastMessage = Message<BroadcastPayload>;
+
 struct MessageStore {
     messages: HashSet<i64>,
 }
@@ -94,20 +100,55 @@ impl MessageStore {
     }
 }
 
-struct BroadcastDelegate {
-    msg_tx: UnboundedSender<Message<BroadcastPayload>>,
-    msg_rx: Option<UnboundedReceiver<Message<BroadcastPayload>>>,
+struct Topology {
+    neighbors: Vec<String>,
+}
 
+impl Topology {
+    fn new(neighbors: Vec<String>) -> Self {
+        Self { neighbors }
+    }
+
+    fn neighbors(&self) -> Vec<String> {
+        self.neighbors.clone()
+    }
+
+    fn set_neighbors(&mut self, neighbors: &[String]) {
+        self.neighbors = neighbors.iter().map(|s| s.clone()).collect();
+    }
+}
+
+struct BroadcastDelegate {
+    msg_tx: UnboundedSender<BroadcastMessage>,
+    msg_rx: Option<UnboundedReceiver<BroadcastMessage>>,
+
+    node_id: String,
     msg_id: i64,
     msg_store: MessageStore,
+    topology: Topology,
 }
 
 impl BroadcastDelegate {
     async fn handle_broadcast(
         &mut self,
-        msg: BroadcastMessagePayload,
+        msg: &BroadcastMessagePayload,
+        src: &str,
     ) -> Result<BroadcastPayload, MaelstromError> {
         self.msg_store.insert(msg.message);
+
+        for n in self.topology.neighbors().iter().filter(|n| *n != src) {
+            let body = MessageBody {
+                msg_id: Some(self.next_msg_id()),
+                in_reply_to: None,
+                local_msg: None,
+                contents: BroadcastPayload::Broadcast(BroadcastMessagePayload {
+                    message: msg.message,
+                }),
+            };
+            let msg = Self::format_outgoing(Some(n), body);
+
+            send!(self.get_msg_tx(), msg, "Delegate egress hung up: {}");
+        }
 
         Ok(BroadcastPayload::BroadcastOk)
     }
@@ -120,15 +161,24 @@ impl BroadcastDelegate {
 
     async fn handle_read_ok(
         &mut self,
-        msg: ReadOkMessagePayload,
+        msg: &ReadOkMessagePayload,
     ) -> Result<BroadcastPayload, MaelstromError> {
         todo!()
     }
 
     async fn handle_topology(
         &mut self,
-        msg: TopologyMessagePayload,
+        msg: &TopologyMessagePayload,
     ) -> Result<BroadcastPayload, MaelstromError> {
+        let neighbors = msg
+            .topology
+            .get(&self.node_id)
+            .ok_or(MaelstromError::Other(format!(
+                "Didn't find self ({}) in topology",
+                self.node_id
+            )))?;
+        self.topology.set_neighbors(&neighbors);
+
         Ok(BroadcastPayload::TopologyOk)
     }
 }
@@ -137,39 +187,46 @@ impl NodeDelegate<BroadcastPayload> for BroadcastDelegate {
     fn init(
         node_id: impl AsRef<str>,
         node_ids: impl AsRef<Vec<String>>,
-        msg_tx: tokio::sync::mpsc::UnboundedSender<
-            maelstrom_csp::message::Message<BroadcastPayload>,
-        >,
-        msg_rx: tokio::sync::mpsc::UnboundedReceiver<
-            maelstrom_csp::message::Message<BroadcastPayload>,
-        >,
+        msg_tx: UnboundedSender<BroadcastMessage>,
+        msg_rx: UnboundedReceiver<BroadcastMessage>,
     ) -> Self {
         Self {
             msg_tx,
             msg_rx: Some(msg_rx),
+            node_id: node_id.as_ref().into(),
             msg_id: 0,
             msg_store: MessageStore::new(),
+            topology: Topology::new(
+                node_ids
+                    .as_ref()
+                    .iter()
+                    .filter(|n| n.as_str() != node_id.as_ref())
+                    .map(|s| s.clone())
+                    .collect(),
+            ),
         }
     }
 
     fn handle_reply(
         &mut self,
-        reply: maelstrom_csp::message::Message<BroadcastPayload>,
-    ) -> impl std::future::Future<Output = Result<(), maelstrom_csp::rpc_error::MaelstromError>> + Send
-    {
+        reply: BroadcastMessage,
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         async { Ok(()) }
     }
 
     fn handle_message(
         &mut self,
-        message: maelstrom_csp::message::Message<BroadcastPayload>,
-    ) -> impl std::future::Future<Output = Result<(), maelstrom_csp::rpc_error::MaelstromError>> + Send
-    {
+        message: BroadcastMessage,
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         async move {
             let response: BroadcastPayload;
-            match message.body.contents.clone() {
+            match &message.body.contents {
                 BroadcastPayload::Broadcast(b) => {
-                    response = self.handle_broadcast(b).await?;
+                    let src = message.src.as_ref().ok_or(MaelstromError::Other(format!(
+                        "No source for message: {:?}",
+                        message
+                    )))?;
+                    response = self.handle_broadcast(b, src).await?;
                 }
                 BroadcastPayload::Read => {
                     response = self.handle_read().await?;
@@ -203,16 +260,11 @@ impl NodeDelegate<BroadcastPayload> for BroadcastDelegate {
         self.msg_id
     }
 
-    fn get_msg_rx(
-        &mut self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<maelstrom_csp::message::Message<BroadcastPayload>>
-    {
+    fn get_msg_rx(&mut self) -> UnboundedReceiver<BroadcastMessage> {
         self.msg_rx.take().unwrap()
     }
 
-    fn get_msg_tx(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<maelstrom_csp::message::Message<BroadcastPayload>> {
+    fn get_msg_tx(&self) -> UnboundedSender<BroadcastMessage> {
         self.msg_tx.clone()
     }
 }
@@ -221,10 +273,8 @@ impl NodeDelegate<BroadcastPayload> for BroadcastDelegate {
 async fn main() {
     env_logger::init();
 
-    let (node, mut ingress, mut egress) = maelstrom_csp::get_node_and_io::<
-        BroadcastPayload,
-        BroadcastDelegate,
-    >(BufReader::new(stdin()), stdout());
+    let (node, mut ingress, mut egress) =
+        get_node_and_io::<BroadcastPayload, BroadcastDelegate>(BufReader::new(stdin()), stdout());
 
     tokio::spawn(async move {
         if let Err(e) = ingress.run().await {
