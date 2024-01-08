@@ -1,3 +1,4 @@
+use common::EchoPayload;
 use maelstrom_csp::{
     message::{InitMessagePayload, Message, MessageBody},
     node::{Node, NodeDelegate, UninitializedNode},
@@ -5,8 +6,6 @@ use maelstrom_csp::{
     send,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-use crate::common::EchoPayload;
 
 mod common;
 
@@ -90,7 +89,7 @@ async fn test_node_runs_echo() {
     if let Some(response) = egress_rx.recv().await {
         assert_eq!(response.src, Some("n1".into()));
         assert_eq!(response.dest, Some("n2".into()));
-        assert_eq!(response.body.msg_id, Some(1));
+        assert_eq!(response.body.msg_id, None);
         assert_eq!(response.body.in_reply_to, Some(1));
         match response.body.contents {
             EchoPayload::EchoOk => (),

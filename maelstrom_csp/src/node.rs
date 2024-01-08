@@ -68,7 +68,18 @@ pub trait NodeDelegate {
         }
     }
 
-    fn reply(&mut self, request: Message<Self::MessageType>, contents: Self::MessageType) -> Result<Message<Self::MessageType>, MaelstromError> {
+    fn send(&self, dest: Option<impl AsRef<str>>, contents: Self::MessageType) -> Message<Self::MessageType> {
+        let body = MessageBody {
+            msg_id: None,
+            in_reply_to: None,
+            local_msg: None,
+            contents,
+        };
+
+        Self::format_outgoing(dest, body)
+    }
+
+    fn reply(&self, request: Message<Self::MessageType>, contents: Self::MessageType) -> Result<Message<Self::MessageType>, MaelstromError> {
         let in_reply_to = Some(request.body.msg_id.ok_or(MaelstromError::RPCError(
             RPCError::new(
                 ErrorType::MalformedRequest.into(),
@@ -76,7 +87,7 @@ pub trait NodeDelegate {
             ),
         ))?);
         let body = MessageBody {
-            msg_id: Some(self.next_msg_id()),
+            msg_id: None,
             in_reply_to,
             local_msg: None,
             contents,
@@ -85,14 +96,15 @@ pub trait NodeDelegate {
         Ok(Self::format_outgoing(request.src, body))
     }
 
-    fn rpc(
-        &mut self,
-        dest: impl AsRef<str>,
-        mut body: MessageBody<Self::MessageType>,
-    ) -> Message<Self::MessageType> {
-        body.msg_id = Some(self.next_msg_id());
+    fn rpc(&mut self, dest: Option<impl AsRef<str>>, contents: Self::MessageType) -> Message<Self::MessageType> {
+        let body = MessageBody {
+            msg_id: Some(self.next_msg_id()),
+            in_reply_to: None,
+            local_msg: None,
+            contents,
+        };
 
-        Self::format_outgoing(Some(dest), body)
+        Self::format_outgoing(dest, body)
     }
 
     fn get_msg_rx(&mut self) -> UnboundedReceiver<Message<Self::MessageType>>;
@@ -392,9 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delegate_runs_on_start() {
-        let (_ingress_tx, ingress_rx) = unbounded_channel::<Message<TestPayload>>();
-        let (egress_tx, mut egress_rx) = unbounded_channel::<Message<TestPayload>>();
-        let mut delegate = TestDelegate::init("", vec![], egress_tx, ingress_rx);
+        let (mut delegate, _ingress_tx, mut egress_rx) = get_delegate_and_channels();
 
         tokio::spawn(async move {
             if let Err(e) = delegate.run().await {
@@ -410,6 +420,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_delegate_formats_send_msg() {
+        let (delegate, _, _) = get_delegate_and_channels();
+        let dest = "n1".to_string();
+
+        let contents = TestPayload::Empty;
+        let sent = delegate.send(Some(dest.clone()), contents);
+
+        assert!(sent.src.is_none());
+        assert_eq!(sent.dest, Some(dest));
+        assert!(sent.body.msg_id.is_none());
+        assert!(sent.body.in_reply_to.is_none());
+        assert!(sent.body.local_msg.is_none());
+    }
+
+    #[test]
+    fn test_delegate_formats_reply_msg() {
+        let (delegate, _, _) = get_delegate_and_channels();
+        let dest = "n1".to_string();
+        let request = Message {
+            src: Some(dest.clone()),
+            dest: None,
+            body: MessageBody {
+                msg_id: Some(1),
+                in_reply_to: None,
+                local_msg: None,
+                contents: TestPayload::Empty,
+            },
+        };
+
+        let contents = TestPayload::Empty;
+        let sent = delegate.reply(request, contents).unwrap();
+
+        assert!(sent.src.is_none());
+        assert_eq!(sent.dest, Some(dest));
+        assert!(sent.body.msg_id.is_none());
+        assert_eq!(sent.body.in_reply_to, Some(1));
+        assert!(sent.body.local_msg.is_none());
+    }
+
+    #[test]
+    fn test_delegate_formats_rpc_msg() {
+        let (mut delegate, _, _) = get_delegate_and_channels();
+        let dest = "n1".to_string();
+
+        let contents = TestPayload::Empty;
+        let sent = delegate.rpc(Some(&dest), contents);
+
+        assert!(sent.src.is_none());
+        assert_eq!(sent.dest, Some(dest));
+        assert_eq!(sent.body.msg_id, Some(1));
+        assert!(sent.body.in_reply_to.is_none());
+        assert!(sent.body.local_msg.is_none());
+    }
+
+    type TestMessage = Message<TestPayload>;
+
     fn get_node_and_channels() -> (
         Node<TestPayload, TestDelegate>,
         UnboundedSender<Message<TestPayload>>,
@@ -423,6 +490,7 @@ mod tests {
             delegate: Some(TestDelegate {
                 msg_tx: ingress_tx.clone(),
                 msg_rx: Some(delegate_rx),
+                msg_id: 0,
             }),
             delegate_tx,
             node_id: "n1".into(),
@@ -435,6 +503,18 @@ mod tests {
         };
 
         (node, ingress_tx, egress_rx)
+    }
+
+    fn get_delegate_and_channels() -> (
+        TestDelegate,
+        UnboundedSender<TestMessage>,
+        UnboundedReceiver<TestMessage>,
+    ) {
+        let (ingress_tx, ingress_rx) = unbounded_channel::<Message<TestPayload>>();
+        let (egress_tx, egress_rx) = unbounded_channel::<Message<TestPayload>>();
+        let delegate = TestDelegate::init("", vec![], egress_tx, ingress_rx);
+
+        (delegate, ingress_tx, egress_rx)
     }
 
     #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -457,6 +537,8 @@ mod tests {
     struct TestDelegate {
         msg_tx: UnboundedSender<Message<TestPayload>>,
         msg_rx: Option<UnboundedReceiver<Message<TestPayload>>>,
+
+        msg_id: i64,
     }
 
     impl NodeDelegate for TestDelegate {
@@ -471,6 +553,7 @@ mod tests {
             Self {
                 msg_tx,
                 msg_rx: Some(msg_rx),
+                msg_id: 0,
             }
         }
 
@@ -511,7 +594,8 @@ mod tests {
         }
 
         fn next_msg_id(&mut self) -> i64 {
-            todo!()
+            self.msg_id += 1;
+            self.msg_id
         }
 
         fn get_msg_rx(&mut self) -> UnboundedReceiver<Message<Self::MessageType>> {

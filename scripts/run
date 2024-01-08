@@ -12,7 +12,7 @@ if [ "$CHALLENGE" == "0" ] ; then
 elif [ "$CHALLENGE" == "1" ] ; then
 	maelstrom test -w unique-ids --bin "$BIN_PATH" --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
 elif [ "$CHALLENGE" == "2" ] ; then
-    maelstrom test -w broadcast --bin "$BIN_PATH" --node-count 5 --time-limit 20 --rate 10
+    maelstrom test -w broadcast --bin "$BIN_PATH" --node-count 5 --time-limit 20 --rate 10 --nemesis partition
 else
 	echo "Unknown challenge: $CHALLENGE"
 	exit 1

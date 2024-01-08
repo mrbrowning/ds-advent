@@ -183,7 +183,8 @@ impl BroadcastDelegate {
     }
 }
 
-impl NodeDelegate<BroadcastPayload> for BroadcastDelegate {
+impl NodeDelegate for BroadcastDelegate {
+    type MessageType = BroadcastPayload;
     fn init(
         node_id: impl AsRef<str>,
         node_ids: impl AsRef<Vec<String>>,
