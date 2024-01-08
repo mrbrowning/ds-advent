@@ -1,4 +1,7 @@
-use std::{collections::HashSet, fmt::Display, marker::PhantomData};
+use std::{
+    future::Future,
+    {collections::HashSet, fmt::Display, marker::PhantomData},
+};
 
 use log::info;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -21,19 +24,19 @@ pub trait NodeDelegate {
         msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
     ) -> Self;
 
-    fn on_start(&mut self) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send {
+    fn on_start(&mut self) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         async { Ok(()) }
     }
 
     fn handle_reply(
         &mut self,
         reply: Message<Self::MessageType>,
-    ) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send;
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send;
 
     fn handle_message(
         &mut self,
         message: Message<Self::MessageType>,
-    ) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send;
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send;
 
     fn next_msg_id(&mut self) -> i64;
 
@@ -68,7 +71,11 @@ pub trait NodeDelegate {
         }
     }
 
-    fn send(&self, dest: Option<impl AsRef<str>>, contents: Self::MessageType) -> Message<Self::MessageType> {
+    fn send(
+        &self,
+        dest: Option<impl AsRef<str>>,
+        contents: Self::MessageType,
+    ) -> Message<Self::MessageType> {
         let body = MessageBody {
             msg_id: None,
             in_reply_to: None,
@@ -79,7 +86,11 @@ pub trait NodeDelegate {
         Self::format_outgoing(dest, body)
     }
 
-    fn reply(&self, request: Message<Self::MessageType>, contents: Self::MessageType) -> Result<Message<Self::MessageType>, MaelstromError> {
+    fn reply(
+        &self,
+        request: Message<Self::MessageType>,
+        contents: Self::MessageType,
+    ) -> Result<Message<Self::MessageType>, MaelstromError> {
         let in_reply_to = Some(request.body.msg_id.ok_or(MaelstromError::RPCError(
             RPCError::new(
                 ErrorType::MalformedRequest.into(),
@@ -96,7 +107,11 @@ pub trait NodeDelegate {
         Ok(Self::format_outgoing(request.src, body))
     }
 
-    fn rpc(&mut self, dest: Option<impl AsRef<str>>, contents: Self::MessageType) -> Message<Self::MessageType> {
+    fn rpc(
+        &mut self,
+        dest: Option<impl AsRef<str>>,
+        contents: Self::MessageType,
+    ) -> Message<Self::MessageType> {
         let body = MessageBody {
             msg_id: Some(self.next_msg_id()),
             in_reply_to: None,
@@ -107,11 +122,27 @@ pub trait NodeDelegate {
         Self::format_outgoing(dest, body)
     }
 
+    fn sync_rpc(
+        &mut self,
+        dest: Option<impl AsRef<str>>,
+        contents: Self::MessageType,
+        on_send: impl Future<Output = ()> + Send + 'static,
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
+        let outgoing = self.rpc(dest, contents);
+        let msg_tx = self.get_msg_tx();
+        async move {
+            send!(msg_tx, outgoing, "Delegate egress hung up: {}");
+            tokio::spawn(on_send);
+
+            Ok(())
+        }
+    }
+
     fn get_msg_rx(&mut self) -> UnboundedReceiver<Message<Self::MessageType>>;
 
     fn get_msg_tx(&self) -> UnboundedSender<Message<Self::MessageType>>;
 
-    fn run(&mut self) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send
+    fn run(&mut self) -> impl Future<Output = Result<(), MaelstromError>> + Send
     where
         Self: std::marker::Send,
     {
@@ -475,6 +506,45 @@ mod tests {
         assert!(sent.body.local_msg.is_none());
     }
 
+    #[tokio::test]
+    async fn test_delegate_runs_sync_rpc() {
+        let (mut delegate, ingress_tx, _egress_rx) = get_delegate_and_channels();
+
+        // Swap out the delegate's ingress channel receiver so we can snoop on it.
+        let (_null_tx, null_rx) = unbounded_channel::<TestMessage>();
+        let mut ingress_rx = delegate.msg_rx.replace(null_rx).unwrap();
+        let ingress_tx_clone = ingress_tx.clone();
+
+        let node = "n3";
+        let on_send = async move {
+            let message = Message {
+                src: Some(node.into()),
+                dest: None,
+                body: MessageBody {
+                    msg_id: None,
+                    in_reply_to: None,
+                    local_msg: None,
+                    contents: TestPayload::Empty,
+                },
+            };
+            if let Err(e) = ingress_tx_clone.send(message) {
+                panic!("Got error from ingress_tx: {}", e);
+            }
+        };
+        if let Err(e) = delegate
+            .sync_rpc(Some("n1"), TestPayload::Empty, on_send)
+            .await
+        {
+            panic!("Got error from sync_rpc: {}", e);
+        }
+
+        if let Some(m) = ingress_rx.recv().await {
+            assert_eq!(m.src, Some(node.into()));
+        } else {
+            panic!("Never received sync_rpc message");
+        }
+    }
+
     type TestMessage = Message<TestPayload>;
 
     fn get_node_and_channels() -> (
@@ -557,9 +627,7 @@ mod tests {
             }
         }
 
-        fn on_start(
-            &mut self,
-        ) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send {
+        fn on_start(&mut self) -> impl Future<Output = Result<(), MaelstromError>> + Send {
             async move {
                 let msg_tx = self.get_msg_tx();
 
@@ -582,14 +650,14 @@ mod tests {
         fn handle_reply(
             &mut self,
             _: Message<Self::MessageType>,
-        ) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send {
+        ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
             async { panic!("Reply should have been ignored") }
         }
 
         fn handle_message(
             &mut self,
             _: Message<Self::MessageType>,
-        ) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send {
+        ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
             async { Ok(()) }
         }
 
