@@ -1,6 +1,6 @@
 use log::error;
 use maelstrom_csp::{
-    message::{ErrorMessagePayload, InitMessagePayload, Message, MessageBody, MessagePayload},
+    message::{ErrorMessagePayload, InitMessagePayload, Message, MessagePayload},
     node::NodeDelegate,
     rpc_error::MaelstromError,
     send,
@@ -86,14 +86,8 @@ impl NodeDelegate for EchoDelegate {
             let msg_tx = self.get_msg_tx();
             match message.clone().body.contents {
                 EchoPayload::Echo(e) => {
-                    let body = MessageBody {
-                        msg_id: Some(self.next_msg_id()),
-                        in_reply_to: None,
-                        local_msg: None,
-                        contents: EchoPayload::EchoOk(e),
-                    };
-
-                    send!(msg_tx, Self::reply(message, body)?, "Egress hung up: {}");
+                    let contents = EchoPayload::EchoOk(e);
+                    send!(msg_tx, self.reply(message, contents)?, "Egress hung up: {}");
                 }
                 _ => (),
             }

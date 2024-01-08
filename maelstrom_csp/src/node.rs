@@ -68,18 +68,19 @@ pub trait NodeDelegate {
         }
     }
 
-    fn reply(
-        request: Message<Self::MessageType>,
-        mut body: MessageBody<Self::MessageType>,
-    ) -> Result<Message<Self::MessageType>, MaelstromError> {
-        let msg_id = request
-            .body
-            .msg_id
-            .ok_or(MaelstromError::RPCError(RPCError::new(
+    fn reply(&mut self, request: Message<Self::MessageType>, contents: Self::MessageType) -> Result<Message<Self::MessageType>, MaelstromError> {
+        let in_reply_to = Some(request.body.msg_id.ok_or(MaelstromError::RPCError(
+            RPCError::new(
                 ErrorType::MalformedRequest.into(),
                 "Message body missing msg_id".to_string(),
-            )))?;
-        body.in_reply_to = Some(msg_id);
+            ),
+        ))?);
+        let body = MessageBody {
+            msg_id: Some(self.next_msg_id()),
+            in_reply_to,
+            local_msg: None,
+            contents,
+        };
 
         Ok(Self::format_outgoing(request.src, body))
     }

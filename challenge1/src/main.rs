@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use log::error;
 use maelstrom_csp::{
-    message::{ErrorMessagePayload, InitMessagePayload, Message, MessageBody, MessagePayload},
+    message::{ErrorMessagePayload, InitMessagePayload, Message, MessagePayload},
     node::NodeDelegate,
     rpc_error::MaelstromError,
     send,
@@ -210,13 +210,8 @@ impl NodeDelegate for UniqueIdDelegate {
             let msg_tx = self.get_msg_tx();
             let id = format!("{:016x}", self.generator.get_next_id());
 
-            let body = MessageBody {
-                msg_id: Some(self.next_msg_id()),
-                in_reply_to: None,
-                local_msg: None,
-                contents: UniqueIdPayload::GenerateOk(GenerateOkPayload { id }),
-            };
-            send!(msg_tx, Self::reply(message, body)?, "Egress hung up: {}");
+            let contents = UniqueIdPayload::GenerateOk(GenerateOkPayload { id });
+            send!(msg_tx, self.reply(message, contents)?, "Egress hung up: {}");
 
             Ok(())
         }

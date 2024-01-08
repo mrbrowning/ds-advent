@@ -2,6 +2,7 @@ use maelstrom_csp::{
     message::{InitMessagePayload, Message, MessageBody},
     node::{Node, NodeDelegate, UninitializedNode},
     rpc_error::MaelstromError,
+    send,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -230,18 +231,11 @@ impl NodeDelegate for EchoDelegate {
             let msg_tx = self.get_msg_tx();
             match message.body.contents {
                 EchoPayload::Echo => {
-                    let body = MessageBody {
-                        msg_id: Some(self.next_msg_id()),
-                        in_reply_to: None,
-                        local_msg: None,
-                        contents: EchoPayload::EchoOk,
-                    };
-                    if let Err(e) = msg_tx.send(Self::reply(message, body)?) {
-                        return Err(MaelstromError::ChannelError(format!(
-                            "Egress hung up: {}",
-                            e
-                        )));
-                    }
+                    send!(
+                        msg_tx,
+                        self.reply(message, EchoPayload::EchoOk)?,
+                        "Egress hung up: {}"
+                    );
                 }
                 _ => (),
             }
