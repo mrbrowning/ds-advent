@@ -133,7 +133,6 @@ async fn test_node_handles_rpc() {
 
     match timeout(Duration::from_millis(100), egress_rx.recv()).await {
         Ok(Some(response)) => {
-            println!("THE HELL?> {:?}", response);
             assert_eq!(response.dest, Some("n2".into()));
         }
         Ok(None) => {
@@ -205,7 +204,6 @@ async fn test_node_ignores_unexpected_reply() {
 
     match timeout(Duration::from_millis(100), egress_rx.recv()).await {
         Ok(Some(response)) => {
-            println!("THE HELL?> {:?}", response);
             assert_eq!(response.dest, Some("n2".into()));
         }
         Ok(None) => {
@@ -231,11 +229,11 @@ async fn test_node_ignores_unexpected_reply() {
     }
 
     // You caught me, this is a bad way to test this. I got ahead of myself and didn't design for testability here.
-    match timeout(Duration::from_millis(1000), egress_rx.recv()).await {
+    match timeout(Duration::from_millis(100), egress_rx.recv()).await {
         Ok(Some(response)) => {
             panic!(
-                "Got unexpected reply to non-existent reply id: {:?}",
-                response
+                "Got unexpected reply to non-existent reply id {:?}: {:?}",
+                response.body.in_reply_to, response
             );
         }
         Ok(None) => {
@@ -266,6 +264,7 @@ fn get_node_and_channels<D: NodeDelegate<MessageType = EchoPayload> + Send>() ->
 struct EchoDelegate {
     msg_rx: Option<UnboundedReceiver<Message<EchoPayload>>>,
     msg_tx: UnboundedSender<Message<EchoPayload>>,
+    self_tx: UnboundedSender<Message<EchoPayload>>,
 
     msg_id: i64,
 }
@@ -278,10 +277,12 @@ impl NodeDelegate for EchoDelegate {
         _: impl AsRef<Vec<String>>,
         msg_tx: UnboundedSender<Message<Self::MessageType>>,
         msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
+        self_tx: UnboundedSender<Message<Self::MessageType>>,
     ) -> Self {
         Self {
             msg_rx: Some(msg_rx),
             msg_tx,
+            self_tx,
             msg_id: 1,
         }
     }
@@ -333,11 +334,16 @@ impl NodeDelegate for EchoDelegate {
     fn get_msg_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
         self.msg_tx.clone()
     }
+
+    fn get_self_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
+        self.self_tx.clone()
+    }
 }
 
 struct RpcDelegate {
     msg_rx: Option<UnboundedReceiver<Message<EchoPayload>>>,
     msg_tx: UnboundedSender<Message<EchoPayload>>,
+    self_tx: UnboundedSender<Message<EchoPayload>>,
 
     msg_id: i64,
     outstanding_replies: HashSet<i64>,
@@ -351,10 +357,12 @@ impl NodeDelegate for RpcDelegate {
         _: impl AsRef<Vec<String>>,
         msg_tx: UnboundedSender<Message<Self::MessageType>>,
         msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
+        self_tx: UnboundedSender<Message<Self::MessageType>>,
     ) -> Self {
         Self {
             msg_rx: Some(msg_rx),
             msg_tx,
+            self_tx,
             msg_id: 0,
             outstanding_replies: HashSet::new(),
         }
@@ -423,5 +431,9 @@ impl NodeDelegate for RpcDelegate {
 
     fn get_msg_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
         self.msg_tx.clone()
+    }
+
+    fn get_self_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
+        self.self_tx.clone()
     }
 }

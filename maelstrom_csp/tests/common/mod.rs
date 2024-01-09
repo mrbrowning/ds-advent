@@ -127,6 +127,14 @@ pub enum EchoPayload {
 
     #[serde(rename = "reply_ok")]
     ReplyOk,
+
+    Empty,
+}
+
+impl Default for EchoPayload {
+    fn default() -> Self {
+        Self::Empty
+    }
 }
 
 impl MessagePayload for EchoPayload {
@@ -139,5 +147,9 @@ impl MessagePayload for EchoPayload {
 
     fn to_init_ok_msg() -> Self {
         Self::InitOk
+    }
+
+    fn to_err_msg(err: ErrorMessagePayload) -> Self {
+        Self::Error(err)
     }
 }

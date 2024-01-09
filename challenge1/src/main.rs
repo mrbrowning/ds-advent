@@ -131,6 +131,14 @@ enum UniqueIdPayload {
 
     #[serde(rename = "error")]
     Error(ErrorMessagePayload),
+
+    Empty,
+}
+
+impl Default for UniqueIdPayload {
+    fn default() -> Self {
+        Self::Empty
+    }
 }
 
 impl MessagePayload for UniqueIdPayload {
@@ -144,11 +152,16 @@ impl MessagePayload for UniqueIdPayload {
     fn to_init_ok_msg() -> Self {
         Self::InitOk
     }
+
+    fn to_err_msg(err: ErrorMessagePayload) -> Self {
+        Self::Error(err)
+    }
 }
 
 struct UniqueIdDelegate {
     msg_rx: Option<UnboundedReceiver<Message<UniqueIdPayload>>>,
     msg_tx: UnboundedSender<Message<UniqueIdPayload>>,
+    self_tx: UnboundedSender<Message<UniqueIdPayload>>,
 
     msg_id: i64,
     outstanding_replies: HashSet<i64>,
@@ -164,6 +177,7 @@ impl NodeDelegate for UniqueIdDelegate {
         node_ids: impl AsRef<Vec<String>>,
         msg_tx: UnboundedSender<Message<Self::MessageType>>,
         msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
+        self_tx: UnboundedSender<Message<Self::MessageType>>,
     ) -> Self {
         let generator_node_id = {
             let generator_node_id = get_node_id(node_id, node_ids.as_ref());
@@ -185,6 +199,7 @@ impl NodeDelegate for UniqueIdDelegate {
         Self {
             msg_rx: Some(msg_rx),
             msg_tx,
+            self_tx,
             msg_id: 0,
             outstanding_replies: HashSet::new(),
             generator,
@@ -238,6 +253,10 @@ impl NodeDelegate for UniqueIdDelegate {
 
     fn get_msg_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
         self.msg_tx.clone()
+    }
+
+    fn get_self_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
+        self.self_tx.clone()
     }
 }
 

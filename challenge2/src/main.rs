@@ -64,6 +64,14 @@ enum BroadcastPayload {
 
     #[serde(rename = "error")]
     Error(ErrorMessagePayload),
+
+    Empty,
+}
+
+impl Default for BroadcastPayload {
+    fn default() -> Self {
+        Self::Empty
+    }
 }
 
 impl MessagePayload for BroadcastPayload {
@@ -76,6 +84,10 @@ impl MessagePayload for BroadcastPayload {
 
     fn to_init_ok_msg() -> Self {
         Self::InitOk
+    }
+
+    fn to_err_msg(err: ErrorMessagePayload) -> Self {
+        Self::Error(err)
     }
 }
 
@@ -126,6 +138,7 @@ impl Topology {
 struct BroadcastDelegate {
     msg_tx: UnboundedSender<BroadcastMessage>,
     msg_rx: Option<UnboundedReceiver<BroadcastMessage>>,
+    self_tx: UnboundedSender<BroadcastMessage>,
     outstanding_replies: HashSet<i64>,
 
     node_id: String,
@@ -201,10 +214,12 @@ impl NodeDelegate for BroadcastDelegate {
         node_ids: impl AsRef<Vec<String>>,
         msg_tx: UnboundedSender<BroadcastMessage>,
         msg_rx: UnboundedReceiver<BroadcastMessage>,
+        self_tx: UnboundedSender<BroadcastMessage>,
     ) -> Self {
         Self {
             msg_tx,
             msg_rx: Some(msg_rx),
+            self_tx,
             outstanding_replies: HashSet::new(),
             node_id: node_id.as_ref().into(),
             msg_id: 0,
@@ -286,6 +301,10 @@ impl NodeDelegate for BroadcastDelegate {
 
     fn get_msg_tx(&self) -> UnboundedSender<BroadcastMessage> {
         self.msg_tx.clone()
+    }
+
+    fn get_self_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
+        self.self_tx.clone()
     }
 }
 

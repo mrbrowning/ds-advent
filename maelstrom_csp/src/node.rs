@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     future::Future,
+    time::Duration,
     {fmt::Display, marker::PhantomData},
 };
 
@@ -8,19 +9,22 @@ use log::info;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::{
-    message::{ErrorMessagePayload, InitMessagePayload, Message, MessageBody, MessagePayload},
+    message::{
+        ErrorMessagePayload, InitMessagePayload, LocalMessage, Message, MessageBody, MessagePayload,
+    },
     rpc_error::{ErrorType, MaelstromError, RPCError},
     send,
 };
 
 pub trait NodeDelegate {
-    type MessageType: MessagePayload + Send;
+    type MessageType: MessagePayload + Clone + Send + 'static;
 
     fn init(
         node_id: impl AsRef<str>,
         node_ids: impl AsRef<Vec<String>>,
         msg_tx: UnboundedSender<Message<Self::MessageType>>,
         msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
+        self_tx: UnboundedSender<Message<Self::MessageType>>,
     ) -> Self;
 
     fn on_start(&mut self) -> impl Future<Output = Result<(), MaelstromError>> + Send {
@@ -58,12 +62,22 @@ pub trait NodeDelegate {
             if self.is_expecting_reply(in_reply_to) {
                 return self.handle_reply(reply).await;
             }
+            info!("Got unexpected reply: {:?}", reply);
 
-            Err(MaelstromError::Other(format!(
-                "Got unexpected reply: {:?}",
-                reply
-            )))
+            Ok(())
         }
+    }
+
+    fn handle_local_message(
+        &mut self,
+        msg: LocalMessage,
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
+        match msg {
+            LocalMessage::Cancel(reply_id) => {
+                self.cancel_reply(reply_id);
+            }
+        }
+        async { Ok(()) }
     }
 
     fn handle_reply(
@@ -102,6 +116,33 @@ pub trait NodeDelegate {
             MaelstromError::IOError(e) => wrap_err(e),
             MaelstromError::Other(e) => wrap_err(e),
             MaelstromError::ChannelError(_) => unreachable!(),
+        }
+    }
+
+    fn handle_err(
+        &self,
+        request: Message<Self::MessageType>,
+        err: MaelstromError,
+    ) -> Result<(), MaelstromError> {
+        match err {
+            MaelstromError::ChannelError(_) => {
+                return Err(err);
+            }
+            _ => (),
+        }
+
+        match self.reply(
+            request,
+            Self::MessageType::to_err_msg(Self::error_body(err)),
+        ) {
+            Ok(r) => self
+                .get_msg_tx()
+                .send(r)
+                .map_err(|e| MaelstromError::ChannelError(format!("Egress hung up: {}", e))),
+            Err(e) => {
+                info!("Couldn't send error reply: {}", e);
+                Ok(())
+            }
         }
     }
 
@@ -173,21 +214,58 @@ pub trait NodeDelegate {
         &mut self,
         dest: Option<impl AsRef<str>>,
         contents: Self::MessageType,
-        on_send: impl Future<Output = ()> + Send + 'static,
+        on_send: Box<dyn FnOnce(i64) -> Box<dyn Future<Output = ()> + Send + 'static>>,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         let outgoing = self.rpc(dest, contents);
         let msg_tx = self.get_msg_tx();
+        let fut = Box::into_pin(on_send(*outgoing.body.msg_id.as_ref().unwrap()));
+
         async move {
             send!(msg_tx, outgoing, "Delegate egress hung up: {}");
-            tokio::spawn(on_send);
+            tokio::spawn(fut);
 
             Ok(())
         }
     }
 
+    fn rpc_with_timeout(
+        &mut self,
+        dest: Option<impl AsRef<str>>,
+        contents: Self::MessageType,
+        duration: u64,
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
+        let msg_tx = self.get_self_tx();
+        self.sync_rpc(
+            dest,
+            contents,
+            Box::new(move |reply_id| {
+                Box::new(async move {
+                    tokio::time::sleep(Duration::from_millis(duration)).await;
+
+                    let r = msg_tx.send(Message {
+                        src: None,
+                        dest: None,
+                        body: MessageBody {
+                            msg_id: None,
+                            in_reply_to: None,
+                            local_msg: Some(LocalMessage::Cancel(reply_id)),
+                            contents: Self::MessageType::default(),
+                        },
+                    });
+
+                    if let Err(e) = r {
+                        panic!("Message egress hung up: {}", e);
+                    }
+                })
+            }),
+        )
+    }
+
     fn get_msg_rx(&mut self) -> UnboundedReceiver<Message<Self::MessageType>>;
 
     fn get_msg_tx(&self) -> UnboundedSender<Message<Self::MessageType>>;
+
+    fn get_self_tx(&self) -> UnboundedSender<Message<Self::MessageType>>;
 
     fn run(&mut self) -> impl Future<Output = Result<(), MaelstromError>> + Send
     where
@@ -212,17 +290,16 @@ pub trait NodeDelegate {
                     msg.unwrap()
                 };
 
-                if msg.body.in_reply_to.is_some() {
-                    let res = self.receive_reply(msg).await;
-                    match res {
-                        Err(MaelstromError::ChannelError(_)) => return Err(res.err().unwrap()),
-                        _ => (),
+                if msg.body.local_msg.is_some() {
+                    self.handle_local_message(msg.body.local_msg.unwrap())
+                        .await?;
+                } else if msg.body.in_reply_to.is_some() {
+                    if let Err(e) = self.receive_reply(msg.clone()).await {
+                        self.handle_err(msg, e)?;
                     }
                 } else {
-                    let res = self.handle_message(msg).await;
-                    match res {
-                        Err(MaelstromError::ChannelError(_)) => return Err(res.err().unwrap()),
-                        _ => (),
+                    if let Err(e) = self.handle_message(msg.clone()).await {
+                        self.handle_err(msg, e)?;
                     }
                 }
             }
@@ -334,6 +411,7 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
             node_ids.clone(),
             ingress_tx.clone(),
             delegate_rx,
+            delegate_tx.clone(),
         );
 
         Self {
@@ -382,6 +460,7 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
 
             let dest = msg.dest.as_ref().unwrap().as_str();
             if dest != self.node_id {
+                // It's outgoing from the delegate, rewrite the source with our ID and send it on the wire.
                 msg.src = Some(self.node_id.clone());
                 send!(self.egress_tx, msg, "Message egress hung up: {}");
 
@@ -488,23 +567,28 @@ mod tests {
         let ingress_tx_clone = ingress_tx.clone();
 
         let node = "n3";
-        let on_send = async move {
-            let message = Message {
-                src: Some(node.into()),
-                dest: None,
-                body: MessageBody {
-                    msg_id: None,
-                    in_reply_to: None,
-                    local_msg: None,
-                    contents: TestPayload::Empty,
-                },
-            };
-            if let Err(e) = ingress_tx_clone.send(message) {
-                panic!("Got error from ingress_tx: {}", e);
-            }
-        };
         if let Err(e) = delegate
-            .sync_rpc(Some("n1"), TestPayload::Empty, on_send)
+            .sync_rpc(
+                Some("n1"),
+                TestPayload::Empty,
+                Box::new(move |_| {
+                    Box::new(async move {
+                        let message = Message {
+                            src: Some(node.into()),
+                            dest: None,
+                            body: MessageBody {
+                                msg_id: None,
+                                in_reply_to: None,
+                                local_msg: None,
+                                contents: TestPayload::Empty,
+                            },
+                        };
+                        if let Err(e) = ingress_tx_clone.send(message) {
+                            panic!("Got error from ingress_tx: {}", e);
+                        }
+                    })
+                }),
+            )
             .await
         {
             panic!("Got error from sync_rpc: {}", e);
@@ -517,6 +601,18 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_delegate_handles_local_msg() {
+        let (mut delegate, _, _) = get_delegate_and_channels();
+        delegate.get_outstanding_replies_mut().insert(1);
+
+        if let Err(e) = delegate.handle_local_message(LocalMessage::Cancel(1)).await {
+            panic!("Got error: {}", e);
+        }
+
+        assert!(!delegate.is_expecting_reply(1));
+    }
+
     type TestMessage = Message<TestPayload>;
 
     fn get_delegate_and_channels() -> (
@@ -526,7 +622,7 @@ mod tests {
     ) {
         let (ingress_tx, ingress_rx) = unbounded_channel::<Message<TestPayload>>();
         let (egress_tx, egress_rx) = unbounded_channel::<Message<TestPayload>>();
-        let delegate = TestDelegate::init("", vec![], egress_tx, ingress_rx);
+        let delegate = TestDelegate::init("", vec![], egress_tx, ingress_rx, ingress_tx.clone());
 
         (delegate, ingress_tx, egress_rx)
     }
@@ -538,12 +634,22 @@ mod tests {
         Empty,
     }
 
+    impl Default for TestPayload {
+        fn default() -> Self {
+            Self::Empty
+        }
+    }
+
     impl MessagePayload for TestPayload {
         fn as_init_msg(&self) -> Option<InitMessagePayload> {
             None
         }
 
         fn to_init_ok_msg() -> Self {
+            todo!()
+        }
+
+        fn to_err_msg(_: ErrorMessagePayload) -> Self {
             todo!()
         }
     }
@@ -564,6 +670,7 @@ mod tests {
             _: impl AsRef<Vec<String>>,
             msg_tx: UnboundedSender<Message<Self::MessageType>>,
             msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
+            _: UnboundedSender<Message<Self::MessageType>>,
         ) -> Self {
             Self {
                 msg_tx,
@@ -625,6 +732,10 @@ mod tests {
 
         fn get_msg_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
             self.msg_tx.clone()
+        }
+
+        fn get_self_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
+            todo!()
         }
     }
 }

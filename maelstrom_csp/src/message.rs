@@ -4,10 +4,12 @@ pub const INIT_MESSAGE_TYPE: &str = "init";
 pub const INIT_MESSAGE_REPLY_TYPE: &str = "init_ok";
 pub const ERROR_MESSAGE_TYPE: &str = "error";
 
-pub trait MessagePayload: std::fmt::Debug {
+pub trait MessagePayload: std::fmt::Debug + Default {
     fn as_init_msg(&self) -> Option<InitMessagePayload>;
 
     fn to_init_ok_msg() -> Self;
+
+    fn to_err_msg(err: ErrorMessagePayload) -> Self;
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

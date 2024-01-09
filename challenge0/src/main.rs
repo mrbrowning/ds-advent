@@ -35,6 +35,14 @@ enum EchoPayload {
 
     #[serde(rename = "error")]
     Error(ErrorMessagePayload),
+
+    Empty,
+}
+
+impl Default for EchoPayload {
+    fn default() -> Self {
+        Self::Empty
+    }
 }
 
 impl MessagePayload for EchoPayload {
@@ -48,11 +56,16 @@ impl MessagePayload for EchoPayload {
     fn to_init_ok_msg() -> Self {
         Self::InitOk
     }
+
+    fn to_err_msg(err: ErrorMessagePayload) -> Self {
+        Self::Error(err)
+    }
 }
 
 struct EchoDelegate {
     msg_rx: Option<UnboundedReceiver<Message<EchoPayload>>>,
     msg_tx: UnboundedSender<Message<EchoPayload>>,
+    self_tx: UnboundedSender<Message<EchoPayload>>,
 
     msg_id: i64,
     outstanding_replies: HashSet<i64>,
@@ -66,10 +79,12 @@ impl NodeDelegate for EchoDelegate {
         _: impl AsRef<Vec<String>>,
         msg_tx: UnboundedSender<Message<Self::MessageType>>,
         msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
+        self_tx: UnboundedSender<Message<Self::MessageType>>,
     ) -> Self {
         Self {
             msg_rx: Some(msg_rx),
             msg_tx,
+            self_tx,
             msg_id: 1,
             outstanding_replies: HashSet::new(),
         }
@@ -118,6 +133,10 @@ impl NodeDelegate for EchoDelegate {
 
     fn get_msg_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
         self.msg_tx.clone()
+    }
+
+    fn get_self_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
+        self.self_tx.clone()
     }
 }
 
