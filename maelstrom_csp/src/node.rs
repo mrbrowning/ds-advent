@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     future::Future,
     {fmt::Display, marker::PhantomData},
 };
@@ -24,6 +25,45 @@ pub trait NodeDelegate {
 
     fn on_start(&mut self) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         async { Ok(()) }
+    }
+
+    fn get_outstanding_replies(&self) -> &HashSet<i64>;
+
+    fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<i64>;
+
+    fn is_expecting_reply(&self, msg_id: i64) -> bool {
+        self.get_outstanding_replies().contains(&msg_id)
+    }
+
+    fn expect_reply(&mut self, msg_id: i64) {
+        self.get_outstanding_replies_mut().insert(msg_id);
+    }
+
+    fn cancel_reply(&mut self, msg_id: i64) {
+        self.get_outstanding_replies_mut().remove(&msg_id);
+    }
+
+    fn receive_reply(
+        &mut self,
+        reply: Message<Self::MessageType>,
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send
+    where
+        Self: Send,
+    {
+        async {
+            let in_reply_to = reply.body.in_reply_to.ok_or(MaelstromError::Other(format!(
+                "Reply missing in_reply_to: {:?}",
+                reply
+            )))?;
+            if self.is_expecting_reply(in_reply_to) {
+                return self.handle_reply(reply).await;
+            }
+
+            Err(MaelstromError::Other(format!(
+                "Got unexpected reply: {:?}",
+                reply
+            )))
+        }
     }
 
     fn handle_reply(
@@ -117,12 +157,14 @@ pub trait NodeDelegate {
         dest: Option<impl AsRef<str>>,
         contents: Self::MessageType,
     ) -> Message<Self::MessageType> {
+        let msg_id = self.next_msg_id();
         let body = MessageBody {
-            msg_id: Some(self.next_msg_id()),
+            msg_id: Some(msg_id),
             in_reply_to: None,
             local_msg: None,
             contents,
         };
+        self.expect_reply(msg_id);
 
         Self::format_outgoing(dest, body)
     }
@@ -171,7 +213,7 @@ pub trait NodeDelegate {
                 };
 
                 if msg.body.in_reply_to.is_some() {
-                    let res = self.handle_reply(msg).await;
+                    let res = self.receive_reply(msg).await;
                     match res {
                         Err(MaelstromError::ChannelError(_)) => return Err(res.err().unwrap()),
                         _ => (),
@@ -511,6 +553,7 @@ mod tests {
         msg_rx: Option<UnboundedReceiver<Message<TestPayload>>>,
 
         msg_id: i64,
+        outstanding_replies: HashSet<i64>,
     }
 
     impl NodeDelegate for TestDelegate {
@@ -526,6 +569,7 @@ mod tests {
                 msg_tx,
                 msg_rx: Some(msg_rx),
                 msg_id: 0,
+                outstanding_replies: HashSet::new(),
             }
         }
 
@@ -547,6 +591,14 @@ mod tests {
 
                 Ok(())
             }
+        }
+
+        fn get_outstanding_replies(&self) -> &HashSet<i64> {
+            &self.outstanding_replies
+        }
+
+        fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<i64> {
+            &mut self.outstanding_replies
         }
 
         fn handle_reply(

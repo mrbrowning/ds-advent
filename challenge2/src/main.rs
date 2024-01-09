@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    hash::Hash,
 };
 
 use log::error;
@@ -125,9 +126,11 @@ impl Topology {
 struct BroadcastDelegate {
     msg_tx: UnboundedSender<BroadcastMessage>,
     msg_rx: Option<UnboundedReceiver<BroadcastMessage>>,
+    outstanding_replies: HashSet<i64>,
 
     node_id: String,
     msg_id: i64,
+
     msg_store: MessageStore,
     topology: Topology,
 }
@@ -202,6 +205,7 @@ impl NodeDelegate for BroadcastDelegate {
         Self {
             msg_tx,
             msg_rx: Some(msg_rx),
+            outstanding_replies: HashSet::new(),
             node_id: node_id.as_ref().into(),
             msg_id: 0,
             msg_store: MessageStore::new(),
@@ -214,6 +218,14 @@ impl NodeDelegate for BroadcastDelegate {
                     .collect(),
             ),
         }
+    }
+
+    fn get_outstanding_replies(&self) -> &HashSet<i64> {
+        &self.outstanding_replies
+    }
+
+    fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<i64> {
+        &mut self.outstanding_replies
     }
 
     fn handle_reply(
