@@ -217,9 +217,8 @@ impl NodeDelegate for UniqueIdDelegate {
         }
     }
 
-    fn next_msg_id(&mut self) -> i64 {
-        self.msg_id += 1;
-        self.msg_id
+    fn get_msg_id(&mut self) -> &mut i64 {
+        &mut self.msg_id
     }
 
     fn get_msg_rx(&mut self) -> UnboundedReceiver<Message<Self::MessageType>> {

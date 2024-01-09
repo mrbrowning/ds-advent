@@ -94,7 +94,7 @@ impl MessageStore {
     fn insert(&mut self, item: i64) -> bool {
         self.messages.insert(item)
     }
-    
+
     fn contains(&self, item: i64) -> bool {
         self.messages.contains(&item)
     }
@@ -264,9 +264,8 @@ impl NodeDelegate for BroadcastDelegate {
         }
     }
 
-    fn next_msg_id(&mut self) -> i64 {
-        self.msg_id += 1;
-        self.msg_id
+    fn get_msg_id(&mut self) -> &mut i64 {
+        &mut self.msg_id
     }
 
     fn get_msg_rx(&mut self) -> UnboundedReceiver<BroadcastMessage> {

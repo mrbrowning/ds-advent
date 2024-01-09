@@ -1,15 +1,13 @@
 use std::{
     future::Future,
-    {collections::HashSet, fmt::Display, marker::PhantomData},
+    {fmt::Display, marker::PhantomData},
 };
 
 use log::info;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::{
-    message::{
-        ErrorMessagePayload, InitMessagePayload, LocalMessage, Message, MessageBody, MessagePayload,
-    },
+    message::{ErrorMessagePayload, InitMessagePayload, Message, MessageBody, MessagePayload},
     rpc_error::{ErrorType, MaelstromError, RPCError},
     send,
 };
@@ -38,7 +36,14 @@ pub trait NodeDelegate {
         message: Message<Self::MessageType>,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send;
 
-    fn next_msg_id(&mut self) -> i64;
+    fn get_msg_id(&mut self) -> &mut i64;
+
+    fn next_msg_id(&mut self) -> i64 {
+        let msg_id = self.get_msg_id();
+        *msg_id += 1;
+
+        *msg_id
+    }
 
     fn error_body(err: MaelstromError) -> ErrorMessagePayload {
         fn wrap_err(err: impl Display) -> ErrorMessagePayload {
@@ -271,8 +276,6 @@ pub struct Node<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + 'st
 
     ingress_rx: UnboundedReceiver<Message<M>>,
     egress_tx: UnboundedSender<Message<M>>,
-
-    outstanding_replies: HashSet<i64>,
 }
 
 impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, D> {
@@ -298,7 +301,6 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
             node_ids: node_ids.into(),
             ingress_rx,
             egress_tx,
-            outstanding_replies: HashSet::new(),
         }
     }
 
@@ -308,19 +310,6 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
 
     pub fn node_ids(&self) -> &[String] {
         &self.node_ids
-    }
-
-    #[cfg(test)]
-    pub fn outstanding_replies(&mut self) -> &mut HashSet<i64> {
-        &mut self.outstanding_replies
-    }
-
-    fn handle_local_message(&mut self, message: LocalMessage) {
-        match message {
-            LocalMessage::Cancel(reply_id) => {
-                self.outstanding_replies.remove(&reply_id);
-            }
-        }
     }
 
     pub async fn run(mut self) -> Result<(), MaelstromError> {
@@ -344,11 +333,6 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
                 msg.unwrap()
             };
 
-            if msg.body.local_msg.is_some() {
-                self.handle_local_message(msg.body.local_msg.take().unwrap());
-                continue;
-            }
-
             if msg.dest.is_none() {
                 info!("Ignoring message with no destination: {:?}", msg);
                 continue;
@@ -357,27 +341,13 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
             let dest = msg.dest.as_ref().unwrap().as_str();
             if dest != self.node_id {
                 msg.src = Some(self.node_id.clone());
-
-                if msg.body.msg_id.is_some() {
-                    // We're expecting a reply to this and will let it through when it arrives.
-                    self.outstanding_replies
-                        .insert(*msg.body.msg_id.as_ref().unwrap());
-                }
                 send!(self.egress_tx, msg, "Message egress hung up: {}");
 
                 continue;
             }
 
             info!("Received {:?}", msg);
-            if msg.body.in_reply_to.is_some()
-                && !self
-                    .outstanding_replies
-                    .contains(msg.body.in_reply_to.as_ref().unwrap())
-            {
-                // This either timed out according to the delegate or we registered it spuriously. Either way, ignore.
-                info!("Ignoring unexpected reply: {:?}", msg);
-                continue;
-            } else if msg.body.contents.as_init_msg().is_some() {
+            if msg.body.contents.as_init_msg().is_some() {
                 info!("Ignoring init message to initialized node");
                 continue;
             }
@@ -391,47 +361,7 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
 mod tests {
     use super::*;
 
-    use std::time::Duration;
-
     use serde::{Deserialize, Serialize};
-    use tokio::time::sleep;
-
-    #[tokio::test]
-    async fn test_node_cancels_expected_reply() {
-        let (mut node, _, _) = get_node_and_channels();
-        node.outstanding_replies().insert(1);
-
-        node.handle_local_message(LocalMessage::Cancel(1));
-        assert!(node.outstanding_replies().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_node_ignores_unexpected_reply() {
-        let (node, ingress_tx, _egress_rx) = get_node_and_channels();
-
-        tokio::spawn(async move {
-            if let Err(e) = node.run().await {
-                panic!("Node died: {}", e);
-            }
-        });
-
-        let msg = Message {
-            src: Some("n2".into()),
-            dest: Some("n1".into()),
-            body: MessageBody {
-                msg_id: Some(1),
-                in_reply_to: Some(1),
-                local_msg: None,
-                contents: TestPayload::Empty,
-            },
-        };
-        if let Err(e) = ingress_tx.send(msg) {
-            panic!("Got error from ingress_rx: {}", e);
-        }
-
-        // You caught me, this is a bad way to test this. I got ahead of myself and didn't design for testability here.
-        sleep(Duration::from_millis(500)).await;
-    }
 
     #[tokio::test]
     async fn test_delegate_runs_on_start() {
@@ -547,34 +477,6 @@ mod tests {
 
     type TestMessage = Message<TestPayload>;
 
-    fn get_node_and_channels() -> (
-        Node<TestPayload, TestDelegate>,
-        UnboundedSender<Message<TestPayload>>,
-        UnboundedReceiver<Message<TestPayload>>,
-    ) {
-        let (ingress_tx, ingress_rx) = unbounded_channel::<Message<TestPayload>>();
-        let (egress_tx, egress_rx) = unbounded_channel::<Message<TestPayload>>();
-        let (delegate_tx, delegate_rx) = unbounded_channel::<Message<TestPayload>>();
-
-        let node: Node<TestPayload, TestDelegate> = Node {
-            delegate: Some(TestDelegate {
-                msg_tx: ingress_tx.clone(),
-                msg_rx: Some(delegate_rx),
-                msg_id: 0,
-            }),
-            delegate_tx,
-            node_id: "n1".into(),
-            node_ids: vec!["n1".into(), "n2".into()],
-
-            ingress_rx,
-            egress_tx,
-
-            outstanding_replies: HashSet::new(),
-        };
-
-        (node, ingress_tx, egress_rx)
-    }
-
     fn get_delegate_and_channels() -> (
         TestDelegate,
         UnboundedSender<TestMessage>,
@@ -661,9 +563,8 @@ mod tests {
             async { Ok(()) }
         }
 
-        fn next_msg_id(&mut self) -> i64 {
-            self.msg_id += 1;
-            self.msg_id
+        fn get_msg_id(&mut self) -> &mut i64 {
+            &mut self.msg_id
         }
 
         fn get_msg_rx(&mut self) -> UnboundedReceiver<Message<Self::MessageType>> {
