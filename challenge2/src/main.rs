@@ -94,6 +94,10 @@ impl MessageStore {
     fn insert(&mut self, item: i64) -> bool {
         self.messages.insert(item)
     }
+    
+    fn contains(&self, item: i64) -> bool {
+        self.messages.contains(&item)
+    }
 
     fn messages(&self) -> Vec<i64> {
         self.messages.iter().map(|x| *x).collect()
@@ -134,6 +138,10 @@ impl BroadcastDelegate {
         msg: &BroadcastMessagePayload,
         src: &str,
     ) -> Result<BroadcastPayload, MaelstromError> {
+        if self.msg_store.contains(msg.message) {
+            return Ok(BroadcastPayload::BroadcastOk);
+        }
+
         self.msg_store.insert(msg.message);
 
         for n in self.topology.neighbors().iter().filter(|n| *n != src) {
