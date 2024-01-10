@@ -1,4 +1,4 @@
-use std::{collections::HashSet, time::SystemTime};
+use std::{collections::HashMap, time::SystemTime};
 
 use log::error;
 use maelstrom_csp::{
@@ -164,7 +164,7 @@ struct UniqueIdDelegate {
     self_tx: UnboundedSender<Message<UniqueIdPayload>>,
 
     msg_id: i64,
-    outstanding_replies: HashSet<i64>,
+    outstanding_replies: HashMap<i64, String>,
 
     generator: Generator,
 }
@@ -201,16 +201,16 @@ impl NodeDelegate for UniqueIdDelegate {
             msg_tx,
             self_tx,
             msg_id: 0,
-            outstanding_replies: HashSet::new(),
+            outstanding_replies: HashMap::new(),
             generator,
         }
     }
 
-    fn get_outstanding_replies(&self) -> &std::collections::HashSet<i64> {
+    fn get_outstanding_replies(&self) -> &std::collections::HashMap<i64, String> {
         &self.outstanding_replies
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashSet<i64> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<i64, String> {
         &mut self.outstanding_replies
     }
 

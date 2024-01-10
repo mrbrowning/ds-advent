@@ -20,6 +20,8 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
 
+const BROADCAST_TIMEOUT_MS: u64 = 100;
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 struct BroadcastMessagePayload {
     message: i64,
@@ -126,12 +128,61 @@ impl Topology {
         Self { neighbors }
     }
 
-    fn neighbors(&self) -> Vec<String> {
-        self.neighbors.clone()
+    fn neighbors(&self) -> &[String] {
+        &self.neighbors
     }
 
     fn set_neighbors(&mut self, neighbors: &[String]) {
         self.neighbors = neighbors.iter().map(|s| s.clone()).collect();
+    }
+
+    fn node_mut(&mut self, name: &str) -> Neighbor {
+        todo!()
+    }
+}
+
+enum NeighborState {
+    Healthy,
+    Unhealthy,
+}
+
+struct Neighbor {
+    node_id: String,
+    state: NeighborState,
+    last_sent: HashMap<i64, i64>,
+    backlog: HashSet<i64>,
+    acked: HashSet<i64>,
+}
+
+impl Neighbor {
+    fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    // TODO: change name
+    async fn transition(
+        &mut self,
+        src: impl AsRef<str>,
+        msg: &BroadcastMessagePayload,
+        delegate: &mut BroadcastDelegate,
+    ) -> Result<(), MaelstromError> {
+        match &self.state {
+            NeighborState::Healthy => {
+                let msg_id = delegate
+                    .rpc_with_timeout(src, BroadcastPayload::Broadcast(*msg), BROADCAST_TIMEOUT_MS)
+                    .await?;
+                self.last_sent.insert(msg_id, msg.message);
+            }
+            NeighborState::Unhealthy => {
+                self.backlog.insert(msg.message);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn acked(&self, message: i64) -> bool {
+        self.acked.contains(&message)
     }
 }
 
@@ -139,7 +190,7 @@ struct BroadcastDelegate {
     msg_tx: UnboundedSender<BroadcastMessage>,
     msg_rx: Option<UnboundedReceiver<BroadcastMessage>>,
     self_tx: UnboundedSender<BroadcastMessage>,
-    outstanding_replies: HashSet<i64>,
+    outstanding_replies: HashMap<i64, String>,
 
     node_id: String,
     msg_id: i64,
@@ -153,28 +204,46 @@ impl BroadcastDelegate {
         &mut self,
         msg: &BroadcastMessagePayload,
         src: &str,
-    ) -> Result<BroadcastPayload, MaelstromError> {
-        if self.msg_store.contains(msg.message) {
-            return Ok(BroadcastPayload::BroadcastOk);
+    ) -> Result<(), MaelstromError> {
+        let value = msg.message;
+        let neighbors: Vec<String> = self
+            .topology
+            .neighbors()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for n in neighbors.iter().filter(|n| n.as_str() != src) {
+            // TODO: change names
+            let mut node = self.topology.node_mut(n);
+            if node.acked(value) {
+                continue;
+            }
+
+            node.transition(src, msg, self).await?;
         }
 
-        self.msg_store.insert(msg.message);
+        Ok(())
+        // if self.msg_store.contains(msg.message) {
+        //     return Ok(BroadcastPayload::BroadcastOk);
+        // }
 
-        for n in self.topology.neighbors().iter().filter(|n| *n != src) {
-            let body = MessageBody {
-                msg_id: Some(self.next_msg_id()),
-                in_reply_to: None,
-                local_msg: None,
-                contents: BroadcastPayload::Broadcast(BroadcastMessagePayload {
-                    message: msg.message,
-                }),
-            };
-            let msg = Self::format_outgoing(Some(n), body);
+        // self.msg_store.insert(msg.message);
 
-            send!(self.get_msg_tx(), msg, "Delegate egress hung up: {}");
-        }
+        // for n in self.topology.neighbors().iter().filter(|n| *n != src) {
+        //     let body = MessageBody {
+        //         msg_id: Some(self.next_msg_id()),
+        //         in_reply_to: None,
+        //         local_msg: None,
+        //         contents: BroadcastPayload::Broadcast(BroadcastMessagePayload {
+        //             message: msg.message,
+        //         }),
+        //     };
+        //     let msg = Self::format_outgoing(Some(n), body);
 
-        Ok(BroadcastPayload::BroadcastOk)
+        //     send!(self.get_msg_tx(), msg, "Delegate egress hung up: {}");
+        // }
+
+        // Ok(BroadcastPayload::BroadcastOk)
     }
 
     async fn handle_read(&self) -> Result<BroadcastPayload, MaelstromError> {
@@ -201,7 +270,7 @@ impl BroadcastDelegate {
                 "Didn't find self ({}) in topology",
                 self.node_id
             )))?;
-        self.topology.set_neighbors(&neighbors);
+        self.topology.set_neighbors(neighbors.as_slice());
 
         Ok(BroadcastPayload::TopologyOk)
     }
@@ -220,7 +289,7 @@ impl NodeDelegate for BroadcastDelegate {
             msg_tx,
             msg_rx: Some(msg_rx),
             self_tx,
-            outstanding_replies: HashSet::new(),
+            outstanding_replies: HashMap::new(),
             node_id: node_id.as_ref().into(),
             msg_id: 0,
             msg_store: MessageStore::new(),
@@ -235,11 +304,11 @@ impl NodeDelegate for BroadcastDelegate {
         }
     }
 
-    fn get_outstanding_replies(&self) -> &HashSet<i64> {
+    fn get_outstanding_replies(&self) -> &HashMap<i64, String> {
         &self.outstanding_replies
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<i64> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<i64, String> {
         &mut self.outstanding_replies
     }
 
@@ -262,9 +331,10 @@ impl NodeDelegate for BroadcastDelegate {
                         "No source for message: {:?}",
                         message
                     )))?;
-                    response = self.handle_broadcast(b, src).await?;
+                    self.handle_broadcast(b, src).await?;
                 }
                 BroadcastPayload::Read => {
+                    // TODO: handle sends
                     response = self.handle_read().await?;
                 }
                 BroadcastPayload::ReadOk(r) => {
@@ -281,14 +351,20 @@ impl NodeDelegate for BroadcastDelegate {
                 }
             };
 
-            send!(
-                self.get_msg_tx(),
-                self.reply(message, response)?,
-                "Delegate egress hung up: {}"
-            );
-
             Ok(())
         }
+    }
+
+    fn handle_local_message(
+        &mut self,
+        msg: maelstrom_csp::message::LocalMessage,
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
+        match msg {
+            // TODO: change reply_id to msg_id
+            maelstrom_csp::message::LocalMessage::Cancel(msg_id) => {}
+        }
+
+        async { todo!() }
     }
 
     fn get_msg_id(&mut self) -> &mut i64 {

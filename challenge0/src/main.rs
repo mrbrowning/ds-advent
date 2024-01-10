@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use log::error;
 use maelstrom_csp::{
@@ -68,7 +68,7 @@ struct EchoDelegate {
     self_tx: UnboundedSender<Message<EchoPayload>>,
 
     msg_id: i64,
-    outstanding_replies: HashSet<i64>,
+    outstanding_replies: HashMap<i64, String>,
 }
 
 impl NodeDelegate for EchoDelegate {
@@ -86,15 +86,15 @@ impl NodeDelegate for EchoDelegate {
             msg_tx,
             self_tx,
             msg_id: 1,
-            outstanding_replies: HashSet::new(),
+            outstanding_replies: HashMap::new(),
         }
     }
 
-    fn get_outstanding_replies(&self) -> &std::collections::HashSet<i64> {
+    fn get_outstanding_replies(&self) -> &std::collections::HashMap<i64, String> {
         &self.outstanding_replies
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashSet<i64> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<i64, String> {
         &mut self.outstanding_replies
     }
 

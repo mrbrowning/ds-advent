@@ -1,4 +1,4 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use common::EchoPayload;
 use maelstrom_csp::{
@@ -287,11 +287,11 @@ impl NodeDelegate for EchoDelegate {
         }
     }
 
-    fn get_outstanding_replies(&self) -> &std::collections::HashSet<i64> {
+    fn get_outstanding_replies(&self) -> &std::collections::HashMap<i64, String> {
         todo!()
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashSet<i64> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<i64, String> {
         todo!()
     }
 
@@ -346,7 +346,7 @@ struct RpcDelegate {
     self_tx: UnboundedSender<Message<EchoPayload>>,
 
     msg_id: i64,
-    outstanding_replies: HashSet<i64>,
+    outstanding_replies: HashMap<i64, String>,
 }
 
 impl NodeDelegate for RpcDelegate {
@@ -364,15 +364,15 @@ impl NodeDelegate for RpcDelegate {
             msg_tx,
             self_tx,
             msg_id: 0,
-            outstanding_replies: HashSet::new(),
+            outstanding_replies: HashMap::new(),
         }
     }
 
-    fn get_outstanding_replies(&self) -> &std::collections::HashSet<i64> {
+    fn get_outstanding_replies(&self) -> &std::collections::HashMap<i64, String> {
         &self.outstanding_replies
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashSet<i64> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<i64, String> {
         &mut self.outstanding_replies
     }
 
@@ -406,11 +406,15 @@ impl NodeDelegate for RpcDelegate {
     ) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send {
         async move {
             let msg_tx = self.get_msg_tx();
+            let src = message.src.clone().ok_or(MaelstromError::Other(format!(
+                "Missing destination: {:?}",
+                message
+            )))?;
             match message.body.contents {
                 EchoPayload::Echo => {
                     send!(
                         msg_tx,
-                        self.rpc(message.src, EchoPayload::EchoOk),
+                        self.rpc(src, EchoPayload::EchoOk),
                         "Egress hung up: {}"
                     );
                 }

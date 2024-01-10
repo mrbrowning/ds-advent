@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     future::Future,
     time::Duration,
     {fmt::Display, marker::PhantomData},
@@ -31,16 +31,18 @@ pub trait NodeDelegate {
         async { Ok(()) }
     }
 
-    fn get_outstanding_replies(&self) -> &HashSet<i64>;
+    // TODO: use newtypes for ids
+    fn get_outstanding_replies(&self) -> &HashMap<i64, String>;
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<i64>;
+    fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<i64, String>;
 
     fn is_expecting_reply(&self, msg_id: i64) -> bool {
-        self.get_outstanding_replies().contains(&msg_id)
+        self.get_outstanding_replies().contains_key(&msg_id)
     }
 
-    fn expect_reply(&mut self, msg_id: i64) {
-        self.get_outstanding_replies_mut().insert(msg_id);
+    fn expect_reply(&mut self, msg_id: i64, node_id: impl AsRef<str>) {
+        self.get_outstanding_replies_mut()
+            .insert(msg_id, node_id.as_ref().into());
     }
 
     fn cancel_reply(&mut self, msg_id: i64) {
@@ -195,7 +197,7 @@ pub trait NodeDelegate {
 
     fn rpc(
         &mut self,
-        dest: Option<impl AsRef<str>>,
+        dest: impl AsRef<str>,
         contents: Self::MessageType,
     ) -> Message<Self::MessageType> {
         let msg_id = self.next_msg_id();
@@ -205,35 +207,36 @@ pub trait NodeDelegate {
             local_msg: None,
             contents,
         };
-        self.expect_reply(msg_id);
+        self.expect_reply(msg_id, dest.as_ref());
 
-        Self::format_outgoing(dest, body)
+        Self::format_outgoing(Some(dest), body)
     }
 
     fn sync_rpc(
         &mut self,
-        dest: Option<impl AsRef<str>>,
+        dest: impl AsRef<str>,
         contents: Self::MessageType,
         on_send: Box<dyn FnOnce(i64) -> Box<dyn Future<Output = ()> + Send + 'static>>,
-    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
+    ) -> impl Future<Output = Result<i64, MaelstromError>> + Send {
         let outgoing = self.rpc(dest, contents);
+        let msg_id = *outgoing.body.msg_id.as_ref().unwrap();
         let msg_tx = self.get_msg_tx();
-        let fut = Box::into_pin(on_send(*outgoing.body.msg_id.as_ref().unwrap()));
+        let fut = Box::into_pin(on_send(msg_id));
 
         async move {
             send!(msg_tx, outgoing, "Delegate egress hung up: {}");
             tokio::spawn(fut);
 
-            Ok(())
+            Ok(msg_id)
         }
     }
 
     fn rpc_with_timeout(
         &mut self,
-        dest: Option<impl AsRef<str>>,
+        dest: impl AsRef<str>,
         contents: Self::MessageType,
         duration: u64,
-    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
+    ) -> impl Future<Output = Result<i64, MaelstromError>> + Send {
         let msg_tx = self.get_self_tx();
         self.sync_rpc(
             dest,
@@ -548,7 +551,7 @@ mod tests {
         let dest = "n1".to_string();
 
         let contents = TestPayload::Empty;
-        let sent = delegate.rpc(Some(&dest), contents);
+        let sent = delegate.rpc(&dest, contents);
 
         assert!(sent.src.is_none());
         assert_eq!(sent.dest, Some(dest));
@@ -569,7 +572,7 @@ mod tests {
         let node = "n3";
         if let Err(e) = delegate
             .sync_rpc(
-                Some("n1"),
+                "n1",
                 TestPayload::Empty,
                 Box::new(move |_| {
                     Box::new(async move {
@@ -604,7 +607,7 @@ mod tests {
     #[tokio::test]
     async fn test_delegate_handles_local_msg() {
         let (mut delegate, _, _) = get_delegate_and_channels();
-        delegate.get_outstanding_replies_mut().insert(1);
+        delegate.get_outstanding_replies_mut().insert(1, "".into());
 
         if let Err(e) = delegate.handle_local_message(LocalMessage::Cancel(1)).await {
             panic!("Got error: {}", e);
@@ -659,7 +662,7 @@ mod tests {
         msg_rx: Option<UnboundedReceiver<Message<TestPayload>>>,
 
         msg_id: i64,
-        outstanding_replies: HashSet<i64>,
+        outstanding_replies: HashMap<i64, String>,
     }
 
     impl NodeDelegate for TestDelegate {
@@ -676,7 +679,7 @@ mod tests {
                 msg_tx,
                 msg_rx: Some(msg_rx),
                 msg_id: 0,
-                outstanding_replies: HashSet::new(),
+                outstanding_replies: HashMap::new(),
             }
         }
 
@@ -700,11 +703,11 @@ mod tests {
             }
         }
 
-        fn get_outstanding_replies(&self) -> &HashSet<i64> {
+        fn get_outstanding_replies(&self) -> &HashMap<i64, String> {
             &self.outstanding_replies
         }
 
-        fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<i64> {
+        fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<i64, String> {
             &mut self.outstanding_replies
         }
 
