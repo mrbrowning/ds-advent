@@ -4,7 +4,7 @@ use std::io;
 use serde::{Deserialize, Serialize};
 use thiserror;
 
-use crate::types::JSONMap;
+use crate::{message::ErrorCode, types::JSONMap};
 
 const ERROR_MSG_TYPE: &str = "error";
 
@@ -40,17 +40,17 @@ pub enum ErrorType {
     TxnConflict = 30,
 }
 
-impl From<ErrorType> for i64 {
+impl From<ErrorType> for ErrorCode {
     fn from(value: ErrorType) -> Self {
-        value as i64
+        (value as i64).into()
     }
 }
 
-impl TryFrom<i64> for ErrorType {
+impl TryFrom<ErrorCode> for ErrorType {
     type Error = MaelstromError;
 
-    fn try_from(value: i64) -> Result<Self, Self::Error> {
-        match value {
+    fn try_from(value: ErrorCode) -> Result<Self, Self::Error> {
+        match value.into() {
             0 => Ok(Self::Timeout),
             10 => Ok(Self::NotSupported),
             11 => Ok(Self::TemporarilyUnavailable),
@@ -71,7 +71,7 @@ impl TryFrom<i64> for ErrorType {
 
 #[derive(thiserror::Error, Debug)]
 pub struct RPCError {
-    code: i64,
+    code: ErrorCode,
     text: String,
 }
 
@@ -79,19 +79,19 @@ pub struct RPCError {
 struct RPCErrorJSON {
     #[serde(rename = "type")]
     msg_type: String,
-    code: i64,
+    code: ErrorCode,
     text: String,
 }
 
 impl RPCError {
-    pub fn new(code: i64, text: impl Into<String>) -> Self {
+    pub fn new(code: ErrorCode, text: impl Into<String>) -> Self {
         RPCError {
             code,
             text: text.into(),
         }
     }
 
-    pub fn error_code(&self) -> i64 {
+    pub fn error_code(&self) -> ErrorCode {
         self.code
     }
 
@@ -99,7 +99,7 @@ impl RPCError {
         &self.text
     }
 
-    pub fn error_code_text(code: i64) -> String {
+    pub fn error_code_text(code: ErrorCode) -> String {
         if let Ok(err_type) = ErrorType::try_from(code) {
             return format!("{:?}", err_type);
         }
@@ -151,7 +151,10 @@ impl From<RPCError> for JSONMap {
     fn from(value: RPCError) -> Self {
         let mut map = JSONMap::new();
         map.insert("type".to_string(), serde_json::Value::from(ERROR_MSG_TYPE));
-        map.insert("code".to_string(), serde_json::Value::from(value.code));
+        map.insert(
+            "code".to_string(),
+            serde_json::Value::from(i64::from(value.code)),
+        );
         map.insert("text".to_string(), serde_json::Value::from(value.text));
 
         map
@@ -164,21 +167,21 @@ mod tests {
 
     #[test]
     fn test_error_code_text() {
-        let test_vals = vec![
-            (ErrorType::Timeout as i64, "Timeout"),
-            (ErrorType::NotSupported as i64, "NotSupported"),
+        let test_vals: Vec<(ErrorCode, &str)> = vec![
+            (ErrorType::Timeout.into(), "Timeout"),
+            (ErrorType::NotSupported.into(), "NotSupported"),
             (
-                ErrorType::TemporarilyUnavailable as i64,
+                ErrorType::TemporarilyUnavailable.into(),
                 "TemporarilyUnavailable",
             ),
-            (ErrorType::MalformedRequest as i64, "MalformedRequest"),
-            (ErrorType::Crash as i64, "Crash"),
-            (ErrorType::Abort as i64, "Abort"),
-            (ErrorType::KeyDoesNotExist as i64, "KeyDoesNotExist"),
-            (ErrorType::KeyAlreadyExists as i64, "KeyAlreadyExists"),
-            (ErrorType::PreconditionFailed as i64, "PreconditionFailed"),
-            (ErrorType::TxnConflict as i64, "TxnConflict"),
-            (1000, "ErrorCode<1000>"),
+            (ErrorType::MalformedRequest.into(), "MalformedRequest"),
+            (ErrorType::Crash.into(), "Crash"),
+            (ErrorType::Abort.into(), "Abort"),
+            (ErrorType::KeyDoesNotExist.into(), "KeyDoesNotExist"),
+            (ErrorType::KeyAlreadyExists.into(), "KeyAlreadyExists"),
+            (ErrorType::PreconditionFailed.into(), "PreconditionFailed"),
+            (ErrorType::TxnConflict.into(), "TxnConflict"),
+            (1000.into(), "ErrorCode<1000>"),
         ];
 
         for (code, code_str) in test_vals {
@@ -189,7 +192,7 @@ mod tests {
     #[test]
     fn test_rpc_error_display() {
         assert_eq!(
-            format!("{}", RPCError::new(ErrorType::Crash as i64, "foo")),
+            format!("{}", RPCError::new(ErrorType::Crash.into(), "foo")),
             "RPCError(Crash, \"foo\")"
         );
     }

@@ -1,8 +1,63 @@
+use std::{
+    fmt::Display,
+    ops::{Add, AddAssign},
+};
+
 use serde::{Deserialize, Serialize};
 
 pub const INIT_MESSAGE_TYPE: &str = "init";
 pub const INIT_MESSAGE_REPLY_TYPE: &str = "init_ok";
 pub const ERROR_MESSAGE_TYPE: &str = "error";
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Hash, Debug)]
+pub struct MessageId(i64);
+
+impl Display for MessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Add<i64> for MessageId {
+    type Output = MessageId;
+
+    fn add(self, rhs: i64) -> Self::Output {
+        MessageId(self.0 + rhs)
+    }
+}
+
+impl AddAssign<i64> for MessageId {
+    fn add_assign(&mut self, rhs: i64) {
+        *self = MessageId(self.0 + rhs);
+    }
+}
+
+impl From<i64> for MessageId {
+    fn from(value: i64) -> Self {
+        MessageId(value)
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Hash, Debug)]
+pub struct ErrorCode(i64);
+
+impl Display for ErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<i64> for ErrorCode {
+    fn from(value: i64) -> Self {
+        ErrorCode(value)
+    }
+}
+
+impl From<ErrorCode> for i64 {
+    fn from(value: ErrorCode) -> Self {
+        value.0
+    }
+}
 
 pub trait MessagePayload: std::fmt::Debug + Default {
     fn as_init_msg(&self) -> Option<InitMessagePayload>;
@@ -14,7 +69,7 @@ pub trait MessagePayload: std::fmt::Debug + Default {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum LocalMessage {
-    Cancel(i64),
+    Cancel(MessageId),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -31,10 +86,10 @@ pub struct Message<B: MessagePayload> {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MessageBody<P: MessagePayload> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub msg_id: Option<i64>,
+    pub msg_id: Option<MessageId>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub in_reply_to: Option<i64>,
+    pub in_reply_to: Option<MessageId>,
 
     #[serde(skip)]
     pub local_msg: Option<LocalMessage>,
@@ -66,6 +121,6 @@ impl InitMessageReplyPayload {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ErrorMessagePayload {
-    pub code: i64,
+    pub code: ErrorCode,
     pub text: String,
 }

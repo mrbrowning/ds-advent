@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use common::EchoPayload;
 use maelstrom_csp::{
-    message::{InitMessagePayload, Message, MessageBody},
+    message::{InitMessagePayload, Message, MessageBody, MessageId},
     node::{Node, NodeDelegate, UninitializedNode},
     rpc_error::MaelstromError,
     send,
@@ -81,7 +81,7 @@ async fn test_node_runs_echo() {
         src: Some("n2".into()),
         dest: Some("n1".into()),
         body: MessageBody {
-            msg_id: Some(1),
+            msg_id: Some(1.into()),
             in_reply_to: None,
             local_msg: None,
             contents: EchoPayload::Echo,
@@ -95,7 +95,7 @@ async fn test_node_runs_echo() {
         assert_eq!(response.src, Some("n1".into()));
         assert_eq!(response.dest, Some("n2".into()));
         assert_eq!(response.body.msg_id, None);
-        assert_eq!(response.body.in_reply_to, Some(1));
+        assert_eq!(response.body.in_reply_to, Some(1.into()));
         match response.body.contents {
             EchoPayload::EchoOk => (),
             _ => panic!("Got unexpected message type: {:?}", response),
@@ -121,7 +121,7 @@ async fn test_node_handles_rpc() {
         src: Some(other_node),
         dest: Some(this_node),
         body: MessageBody {
-            msg_id: Some(1),
+            msg_id: Some(1.into()),
             in_reply_to: None,
             local_msg: None,
             contents: EchoPayload::Echo,
@@ -147,8 +147,8 @@ async fn test_node_handles_rpc() {
         src: Some("n2".into()),
         dest: Some("n1".into()),
         body: MessageBody {
-            msg_id: Some(1),
-            in_reply_to: Some(1),
+            msg_id: Some(1.into()),
+            in_reply_to: Some(1.into()),
             local_msg: None,
             contents: EchoPayload::EchoOk,
         },
@@ -161,7 +161,7 @@ async fn test_node_handles_rpc() {
         Ok(Some(response)) => {
             assert_eq!(response.src, Some("n1".into()));
             assert_eq!(response.dest, Some("n2".into()));
-            assert_eq!(response.body.msg_id, Some(2));
+            assert_eq!(response.body.msg_id, Some(2.into()));
             match response.body.contents {
                 EchoPayload::ReplyOk => (),
                 _ => panic!("Got unexpected message type: {:?}", response),
@@ -192,7 +192,7 @@ async fn test_node_ignores_unexpected_reply() {
         src: Some(other_node),
         dest: Some(this_node),
         body: MessageBody {
-            msg_id: Some(1),
+            msg_id: Some(1.into()),
             in_reply_to: None,
             local_msg: None,
             contents: EchoPayload::Echo,
@@ -218,8 +218,8 @@ async fn test_node_ignores_unexpected_reply() {
         src: Some("n2".into()),
         dest: Some("n1".into()),
         body: MessageBody {
-            msg_id: Some(1),
-            in_reply_to: Some(2),
+            msg_id: Some(1.into()),
+            in_reply_to: Some(2.into()),
             local_msg: None,
             contents: EchoPayload::EchoOk,
         },
@@ -266,7 +266,7 @@ struct EchoDelegate {
     msg_tx: UnboundedSender<Message<EchoPayload>>,
     self_tx: UnboundedSender<Message<EchoPayload>>,
 
-    msg_id: i64,
+    msg_id: MessageId,
 }
 
 impl NodeDelegate for EchoDelegate {
@@ -283,15 +283,15 @@ impl NodeDelegate for EchoDelegate {
             msg_rx: Some(msg_rx),
             msg_tx,
             self_tx,
-            msg_id: 1,
+            msg_id: 1.into(),
         }
     }
 
-    fn get_outstanding_replies(&self) -> &std::collections::HashMap<i64, String> {
+    fn get_outstanding_replies(&self) -> &std::collections::HashMap<MessageId, String> {
         todo!()
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<i64, String> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<MessageId, String> {
         todo!()
     }
 
@@ -323,7 +323,7 @@ impl NodeDelegate for EchoDelegate {
         }
     }
 
-    fn get_msg_id(&mut self) -> &mut i64 {
+    fn get_msg_id(&mut self) -> &mut MessageId {
         &mut self.msg_id
     }
 
@@ -345,8 +345,8 @@ struct RpcDelegate {
     msg_tx: UnboundedSender<Message<EchoPayload>>,
     self_tx: UnboundedSender<Message<EchoPayload>>,
 
-    msg_id: i64,
-    outstanding_replies: HashMap<i64, String>,
+    msg_id: MessageId,
+    outstanding_replies: HashMap<MessageId, String>,
 }
 
 impl NodeDelegate for RpcDelegate {
@@ -363,16 +363,16 @@ impl NodeDelegate for RpcDelegate {
             msg_rx: Some(msg_rx),
             msg_tx,
             self_tx,
-            msg_id: 0,
+            msg_id: 0.into(),
             outstanding_replies: HashMap::new(),
         }
     }
 
-    fn get_outstanding_replies(&self) -> &std::collections::HashMap<i64, String> {
+    fn get_outstanding_replies(&self) -> &std::collections::HashMap<MessageId, String> {
         &self.outstanding_replies
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<i64, String> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<MessageId, String> {
         &mut self.outstanding_replies
     }
 
@@ -383,7 +383,7 @@ impl NodeDelegate for RpcDelegate {
         async move {
             let msg_tx = self.get_msg_tx();
             let body = MessageBody {
-                msg_id: Some(2),
+                msg_id: Some(2.into()),
                 in_reply_to: None,
                 local_msg: None,
                 contents: EchoPayload::ReplyOk,
@@ -425,7 +425,7 @@ impl NodeDelegate for RpcDelegate {
         }
     }
 
-    fn get_msg_id(&mut self) -> &mut i64 {
+    fn get_msg_id(&mut self) -> &mut MessageId {
         &mut self.msg_id
     }
 

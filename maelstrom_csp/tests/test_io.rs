@@ -60,7 +60,7 @@ async fn test_ingress_ingests_msg() {
     let msg = rx.recv().await;
     if let Some(m) = msg {
         assert_eq!(m.dest, Some("n1".into()));
-        assert_eq!(m.body.msg_id, Some(1));
+        assert_eq!(m.body.msg_id, Some(1.into()));
         match m.body.contents {
             EchoPayload::Echo => (),
             _ => panic!("Got unexpected message type: {:?}", m.body),
@@ -84,7 +84,7 @@ async fn test_egress_writes_msg() {
         src: None,
         dest: Some("n2".into()),
         body: MessageBody {
-            msg_id: Some(1),
+            msg_id: Some(1.into()),
             in_reply_to: None,
             local_msg: None,
             contents: EchoPayload::Echo,

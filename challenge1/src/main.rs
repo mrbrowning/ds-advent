@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::SystemTime};
 
 use log::error;
 use maelstrom_csp::{
-    message::{ErrorMessagePayload, InitMessagePayload, Message, MessagePayload},
+    message::{ErrorMessagePayload, InitMessagePayload, Message, MessageId, MessagePayload},
     node::NodeDelegate,
     rpc_error::MaelstromError,
     send,
@@ -163,8 +163,8 @@ struct UniqueIdDelegate {
     msg_tx: UnboundedSender<Message<UniqueIdPayload>>,
     self_tx: UnboundedSender<Message<UniqueIdPayload>>,
 
-    msg_id: i64,
-    outstanding_replies: HashMap<i64, String>,
+    msg_id: MessageId,
+    outstanding_replies: HashMap<MessageId, String>,
 
     generator: Generator,
 }
@@ -200,17 +200,17 @@ impl NodeDelegate for UniqueIdDelegate {
             msg_rx: Some(msg_rx),
             msg_tx,
             self_tx,
-            msg_id: 0,
+            msg_id: 0.into(),
             outstanding_replies: HashMap::new(),
             generator,
         }
     }
 
-    fn get_outstanding_replies(&self) -> &std::collections::HashMap<i64, String> {
+    fn get_outstanding_replies(&self) -> &std::collections::HashMap<MessageId, String> {
         &self.outstanding_replies
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<i64, String> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut std::collections::HashMap<MessageId, String> {
         &mut self.outstanding_replies
     }
 
@@ -243,7 +243,7 @@ impl NodeDelegate for UniqueIdDelegate {
         }
     }
 
-    fn get_msg_id(&mut self) -> &mut i64 {
+    fn get_msg_id(&mut self) -> &mut MessageId {
         &mut self.msg_id
     }
 

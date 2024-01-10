@@ -10,7 +10,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::{
     message::{
-        ErrorMessagePayload, InitMessagePayload, LocalMessage, Message, MessageBody, MessagePayload,
+        ErrorMessagePayload, InitMessagePayload, LocalMessage, Message, MessageBody, MessageId,
+        MessagePayload,
     },
     rpc_error::{ErrorType, MaelstromError, RPCError},
     send,
@@ -32,20 +33,20 @@ pub trait NodeDelegate {
     }
 
     // TODO: use newtypes for ids
-    fn get_outstanding_replies(&self) -> &HashMap<i64, String>;
+    fn get_outstanding_replies(&self) -> &HashMap<MessageId, String>;
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<i64, String>;
+    fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<MessageId, String>;
 
-    fn is_expecting_reply(&self, msg_id: i64) -> bool {
+    fn is_expecting_reply(&self, msg_id: MessageId) -> bool {
         self.get_outstanding_replies().contains_key(&msg_id)
     }
 
-    fn expect_reply(&mut self, msg_id: i64, node_id: impl AsRef<str>) {
+    fn expect_reply(&mut self, msg_id: MessageId, node_id: impl AsRef<str>) {
         self.get_outstanding_replies_mut()
             .insert(msg_id, node_id.as_ref().into());
     }
 
-    fn cancel_reply(&mut self, msg_id: i64) {
+    fn cancel_reply(&mut self, msg_id: MessageId) {
         self.get_outstanding_replies_mut().remove(&msg_id);
     }
 
@@ -92,9 +93,9 @@ pub trait NodeDelegate {
         message: Message<Self::MessageType>,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send;
 
-    fn get_msg_id(&mut self) -> &mut i64;
+    fn get_msg_id(&mut self) -> &mut MessageId;
 
-    fn next_msg_id(&mut self) -> i64 {
+    fn next_msg_id(&mut self) -> MessageId {
         let msg_id = self.get_msg_id();
         *msg_id += 1;
 
@@ -216,8 +217,8 @@ pub trait NodeDelegate {
         &mut self,
         dest: impl AsRef<str>,
         contents: Self::MessageType,
-        on_send: Box<dyn FnOnce(i64) -> Box<dyn Future<Output = ()> + Send + 'static>>,
-    ) -> impl Future<Output = Result<i64, MaelstromError>> + Send {
+        on_send: Box<dyn FnOnce(MessageId) -> Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> impl Future<Output = Result<MessageId, MaelstromError>> + Send {
         let outgoing = self.rpc(dest, contents);
         let msg_id = *outgoing.body.msg_id.as_ref().unwrap();
         let msg_tx = self.get_msg_tx();
@@ -236,7 +237,7 @@ pub trait NodeDelegate {
         dest: impl AsRef<str>,
         contents: Self::MessageType,
         duration: u64,
-    ) -> impl Future<Output = Result<i64, MaelstromError>> + Send {
+    ) -> impl Future<Output = Result<MessageId, MaelstromError>> + Send {
         let msg_tx = self.get_self_tx();
         self.sync_rpc(
             dest,
@@ -337,7 +338,7 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Uninitia
 
     pub async fn run(mut self) -> Result<Node<M, D>, MaelstromError> {
         let init_msg: InitMessagePayload;
-        let in_reply_to: Option<i64>;
+        let in_reply_to: Option<MessageId>;
         let dest: Option<String>;
 
         loop {
@@ -499,7 +500,7 @@ mod tests {
 
         if let Some(m) = egress_rx.recv().await {
             assert_eq!(m.dest, Some("n1".into()));
-            assert_eq!(m.body.msg_id, Some(1));
+            assert_eq!(m.body.msg_id, Some(1.into()));
         } else {
             panic!("Failed to receive on_start message from delegate");
         }
@@ -528,7 +529,7 @@ mod tests {
             src: Some(dest.clone()),
             dest: None,
             body: MessageBody {
-                msg_id: Some(1),
+                msg_id: Some(1.into()),
                 in_reply_to: None,
                 local_msg: None,
                 contents: TestPayload::Empty,
@@ -541,7 +542,7 @@ mod tests {
         assert!(sent.src.is_none());
         assert_eq!(sent.dest, Some(dest));
         assert!(sent.body.msg_id.is_none());
-        assert_eq!(sent.body.in_reply_to, Some(1));
+        assert_eq!(sent.body.in_reply_to, Some(1.into()));
         assert!(sent.body.local_msg.is_none());
     }
 
@@ -555,7 +556,7 @@ mod tests {
 
         assert!(sent.src.is_none());
         assert_eq!(sent.dest, Some(dest));
-        assert_eq!(sent.body.msg_id, Some(1));
+        assert_eq!(sent.body.msg_id, Some(1.into()));
         assert!(sent.body.in_reply_to.is_none());
         assert!(sent.body.local_msg.is_none());
     }
@@ -607,13 +608,18 @@ mod tests {
     #[tokio::test]
     async fn test_delegate_handles_local_msg() {
         let (mut delegate, _, _) = get_delegate_and_channels();
-        delegate.get_outstanding_replies_mut().insert(1, "".into());
+        delegate
+            .get_outstanding_replies_mut()
+            .insert(1.into(), "".into());
 
-        if let Err(e) = delegate.handle_local_message(LocalMessage::Cancel(1)).await {
+        if let Err(e) = delegate
+            .handle_local_message(LocalMessage::Cancel(1.into()))
+            .await
+        {
             panic!("Got error: {}", e);
         }
 
-        assert!(!delegate.is_expecting_reply(1));
+        assert!(!delegate.is_expecting_reply(1.into()));
     }
 
     type TestMessage = Message<TestPayload>;
@@ -661,8 +667,8 @@ mod tests {
         msg_tx: UnboundedSender<Message<TestPayload>>,
         msg_rx: Option<UnboundedReceiver<Message<TestPayload>>>,
 
-        msg_id: i64,
-        outstanding_replies: HashMap<i64, String>,
+        msg_id: MessageId,
+        outstanding_replies: HashMap<MessageId, String>,
     }
 
     impl NodeDelegate for TestDelegate {
@@ -678,7 +684,7 @@ mod tests {
             Self {
                 msg_tx,
                 msg_rx: Some(msg_rx),
-                msg_id: 0,
+                msg_id: 0.into(),
                 outstanding_replies: HashMap::new(),
             }
         }
@@ -691,7 +697,7 @@ mod tests {
                     src: None,
                     dest: Some("n1".into()),
                     body: MessageBody {
-                        msg_id: Some(1),
+                        msg_id: Some(1.into()),
                         in_reply_to: None,
                         local_msg: None,
                         contents: TestPayload::Empty,
@@ -703,11 +709,11 @@ mod tests {
             }
         }
 
-        fn get_outstanding_replies(&self) -> &HashMap<i64, String> {
+        fn get_outstanding_replies(&self) -> &HashMap<MessageId, String> {
             &self.outstanding_replies
         }
 
-        fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<i64, String> {
+        fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<MessageId, String> {
             &mut self.outstanding_replies
         }
 
@@ -725,7 +731,7 @@ mod tests {
             async { Ok(()) }
         }
 
-        fn get_msg_id(&mut self) -> &mut i64 {
+        fn get_msg_id(&mut self) -> &mut MessageId {
             &mut self.msg_id
         }
 

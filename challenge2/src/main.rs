@@ -9,7 +9,9 @@ use std::{
 use log::error;
 use maelstrom_csp::{
     get_node_and_io,
-    message::{ErrorMessagePayload, InitMessagePayload, Message, MessageBody, MessagePayload},
+    message::{
+        ErrorMessagePayload, InitMessagePayload, Message, MessageBody, MessageId, MessagePayload,
+    },
     node::NodeDelegate,
     rpc_error::MaelstromError,
     send,
@@ -136,11 +138,12 @@ impl Topology {
         self.neighbors = neighbors.iter().map(|s| s.clone()).collect();
     }
 
-    fn node_mut(&mut self, name: &str) -> Neighbor {
+    fn node_mut(&mut self, name: &str) -> Option<Neighbor> {
         todo!()
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 enum NeighborState {
     Healthy,
     Unhealthy,
@@ -149,7 +152,7 @@ enum NeighborState {
 struct Neighbor {
     node_id: String,
     state: NeighborState,
-    last_sent: HashMap<i64, i64>,
+    last_sent: HashMap<MessageId, i64>,
     backlog: HashSet<i64>,
     acked: HashSet<i64>,
 }
@@ -184,16 +187,42 @@ impl Neighbor {
     fn acked(&self, message: i64) -> bool {
         self.acked.contains(&message)
     }
+
+    async fn die(
+        &mut self,
+        src: impl AsRef<str>,
+        msg_id: MessageId,
+        delegate: &mut BroadcastDelegate,
+    ) -> Result<(), MaelstromError> {
+        // TODO: I'm here
+        match self.state {
+            NeighborState::Healthy => {
+                // mark as unhealthy, store whatever
+                self.state = NeighborState::Unhealthy;
+                let msg_id = delegate
+                    .rpc_with_timeout(
+                        src,
+                        BroadcastPayload::Broadcast(todo!()),
+                        BROADCAST_TIMEOUT_MS,
+                    )
+                    .await?;
+            }
+            NeighborState::Unhealthy => {
+                // dnothing
+                todo!()
+            }
+        }
+    }
 }
 
 struct BroadcastDelegate {
     msg_tx: UnboundedSender<BroadcastMessage>,
     msg_rx: Option<UnboundedReceiver<BroadcastMessage>>,
     self_tx: UnboundedSender<BroadcastMessage>,
-    outstanding_replies: HashMap<i64, String>,
+    outstanding_replies: HashMap<MessageId, String>,
 
     node_id: String,
-    msg_id: i64,
+    msg_id: MessageId,
 
     msg_store: MessageStore,
     topology: Topology,
@@ -214,7 +243,13 @@ impl BroadcastDelegate {
             .collect();
         for n in neighbors.iter().filter(|n| n.as_str() != src) {
             // TODO: change names
-            let mut node = self.topology.node_mut(n);
+            let mut node = self
+                .topology
+                .node_mut(n)
+                .ok_or(MaelstromError::Other(format!(
+                    "Couldn't find node in neighbors: {}",
+                    n
+                )))?;
             if node.acked(value) {
                 continue;
             }
@@ -291,7 +326,7 @@ impl NodeDelegate for BroadcastDelegate {
             self_tx,
             outstanding_replies: HashMap::new(),
             node_id: node_id.as_ref().into(),
-            msg_id: 0,
+            msg_id: 0.into(),
             msg_store: MessageStore::new(),
             topology: Topology::new(
                 node_ids
@@ -304,11 +339,12 @@ impl NodeDelegate for BroadcastDelegate {
         }
     }
 
-    fn get_outstanding_replies(&self) -> &HashMap<i64, String> {
+    // TODO: ways to test this -- add cfg(test) code, maybe to wrap get_msg_tx and whatnot, and interpose a snoop channel tehre that you can read
+    fn get_outstanding_replies(&self) -> &HashMap<MessageId, String> {
         &self.outstanding_replies
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<i64, String> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<MessageId, String> {
         &mut self.outstanding_replies
     }
 
@@ -359,15 +395,34 @@ impl NodeDelegate for BroadcastDelegate {
         &mut self,
         msg: maelstrom_csp::message::LocalMessage,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
-        match msg {
-            // TODO: change reply_id to msg_id
-            maelstrom_csp::message::LocalMessage::Cancel(msg_id) => {}
-        }
+        async move {
+            let (node_id, msg_id) = match msg {
+                // TODO: change reply_id to msg_id everywhere
+                maelstrom_csp::message::LocalMessage::Cancel(msg_id) => (
+                    self.outstanding_replies
+                        .remove(&msg_id)
+                        .ok_or(MaelstromError::Other(format!(
+                            "Couldn't find reply id for message: {:?}",
+                            msg
+                        )))?,
+                    msg_id,
+                ),
+            };
 
-        async { todo!() }
+            let mut node = self
+                .topology
+                .node_mut(&node_id)
+                .ok_or(MaelstromError::Other(format!(
+                    "Couldn't find node in neighbors: {}",
+                    node_id
+                )))?;
+            node.die(&node_id, msg_id, self).await?;
+
+            Ok(())
+        }
     }
 
-    fn get_msg_id(&mut self) -> &mut i64 {
+    fn get_msg_id(&mut self) -> &mut MessageId {
         &mut self.msg_id
     }
 
