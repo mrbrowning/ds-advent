@@ -5,6 +5,7 @@ use std::{
     {fmt::Display, marker::PhantomData},
 };
 
+use futures::FutureExt;
 use log::info;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -202,6 +203,16 @@ pub trait NodeDelegate {
         contents: Self::MessageType,
     ) -> Message<Self::MessageType> {
         let msg_id = self.next_msg_id();
+
+        self.rpc_with_msg_id(dest, contents, msg_id)
+    }
+
+    fn rpc_with_msg_id(
+        &mut self,
+        dest: impl AsRef<str>,
+        contents: Self::MessageType,
+        msg_id: MessageId,
+    ) -> Message<Self::MessageType> {
         let body = MessageBody {
             msg_id: Some(msg_id),
             in_reply_to: None,
@@ -219,8 +230,20 @@ pub trait NodeDelegate {
         contents: Self::MessageType,
         on_send: Box<dyn FnOnce(MessageId) -> Box<dyn Future<Output = ()> + Send + 'static>>,
     ) -> impl Future<Output = Result<MessageId, MaelstromError>> + Send {
-        let outgoing = self.rpc(dest, contents);
-        let msg_id = *outgoing.body.msg_id.as_ref().unwrap();
+        let msg_id = self.next_msg_id();
+
+        self.sync_rpc_with_msg_id(dest, contents, on_send, msg_id)
+            .map(move |r| r.map(move |_| msg_id))
+    }
+
+    fn sync_rpc_with_msg_id(
+        &mut self,
+        dest: impl AsRef<str>,
+        contents: Self::MessageType,
+        on_send: Box<dyn FnOnce(MessageId) -> Box<dyn Future<Output = ()> + Send + 'static>>,
+        msg_id: MessageId,
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
+        let outgoing = self.rpc_with_msg_id(dest, contents, msg_id);
         let msg_tx = self.get_msg_tx();
         let fut = Box::into_pin(on_send(msg_id));
 
@@ -228,7 +251,7 @@ pub trait NodeDelegate {
             send!(msg_tx, outgoing, "Delegate egress hung up: {}");
             tokio::spawn(fut);
 
-            Ok(msg_id)
+            Ok(())
         }
     }
 
@@ -238,8 +261,21 @@ pub trait NodeDelegate {
         contents: Self::MessageType,
         duration: u64,
     ) -> impl Future<Output = Result<MessageId, MaelstromError>> + Send {
+        let msg_id = self.next_msg_id();
+
+        self.rpc_with_timeout_with_msg_id(dest, contents, duration, msg_id)
+            .map(move |r| r.map(move |_| msg_id))
+    }
+
+    fn rpc_with_timeout_with_msg_id(
+        &mut self,
+        dest: impl AsRef<str>,
+        contents: Self::MessageType,
+        duration: u64,
+        msg_id: MessageId,
+    ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         let msg_tx = self.get_self_tx();
-        self.sync_rpc(
+        self.sync_rpc_with_msg_id(
             dest,
             contents,
             Box::new(move |reply_id| {
@@ -262,6 +298,7 @@ pub trait NodeDelegate {
                     }
                 })
             }),
+            msg_id,
         )
     }
 
