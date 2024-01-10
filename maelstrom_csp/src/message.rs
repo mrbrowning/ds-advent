@@ -9,7 +9,7 @@ pub const INIT_MESSAGE_TYPE: &str = "init";
 pub const INIT_MESSAGE_REPLY_TYPE: &str = "init_ok";
 pub const ERROR_MESSAGE_TYPE: &str = "error";
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Hash, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Ord, PartialOrd, Clone, Copy, Hash, Debug)]
 pub struct MessageId(i64);
 
 impl Display for MessageId {
@@ -69,7 +69,7 @@ pub trait MessagePayload: std::fmt::Debug + Default {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum LocalMessage {
-    Cancel(MessageId),
+    Cancel(MessageId, String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

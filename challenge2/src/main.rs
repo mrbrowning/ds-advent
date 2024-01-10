@@ -4,13 +4,15 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     hash::Hash,
+    marker::PhantomData,
 };
 
 use log::error;
 use maelstrom_csp::{
     get_node_and_io,
     message::{
-        ErrorMessagePayload, InitMessagePayload, Message, MessageBody, MessageId, MessagePayload,
+        ErrorMessagePayload, InitMessagePayload, LocalMessage, Message, MessageBody, MessageId,
+        MessagePayload,
     },
     node::NodeDelegate,
     rpc_error::MaelstromError,
@@ -141,6 +143,10 @@ impl Topology {
     fn node_mut(&mut self, name: &str) -> Option<Neighbor> {
         todo!()
     }
+
+    fn delete_me(&self, get_msg_id: Box<dyn FnOnce() -> MessageId>) {
+        let x = get_msg_id();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,7 +155,61 @@ enum NeighborState {
     Unhealthy,
 }
 
+trait NState {}
+struct Healthy {}
+struct Unhealthy {}
+
+impl NState for Healthy {}
+impl NState for Unhealthy {}
+
+trait StateManager {
+    fn accept_broadcast(self, msg: &BroadcastMessagePayload) -> (Box<dyn StateManager>, Command);
+
+    fn accept_timeout(self, msg: &LocalMessage) -> (Box<dyn StateManager>, Command);
+
+    fn accept_broadcast_ok(self) -> (Box<dyn StateManager>, Command);
+}
+
+struct NStateHolder<S: NState> {
+    pending: HashMap<MessageId, i64>,
+    backlog: HashSet<i64>,
+    acked: HashSet<i64>,
+
+    _marker: PhantomData<S>,
+}
+
+enum Command {}
+
+impl StateManager for NStateHolder<Healthy> {
+    fn accept_broadcast(self, msg: &BroadcastMessagePayload) -> (Box<dyn StateManager>, Command) {
+        todo!()
+    }
+
+    fn accept_timeout(self, msg: &LocalMessage) -> (Box<dyn StateManager>, Command) {
+        todo!()
+    }
+
+    fn accept_broadcast_ok(self) -> (Box<dyn StateManager>, Command) {
+        todo!()
+    }
+}
+
+impl StateManager for NStateHolder<Unhealthy> {
+    fn accept_broadcast(self, msg: &BroadcastMessagePayload) -> (Box<dyn StateManager>, Command) {
+        todo!()
+    }
+
+    fn accept_timeout(self, msg: &LocalMessage) -> (Box<dyn StateManager>, Command) {
+        todo!()
+    }
+
+    fn accept_broadcast_ok(self) -> (Box<dyn StateManager>, Command) {
+        todo!()
+    }
+}
+
 struct Neighbor {
+    nstate: Box<dyn StateManager>,
     node_id: String,
     state: NeighborState,
     last_sent: HashMap<MessageId, i64>,
@@ -158,14 +218,26 @@ struct Neighbor {
 }
 
 impl Neighbor {
+    // Neighbor is a state machine with two states, three possible messages that will cause transitions (broadcast, rpc timeout, broadcast ok)
+    // IN healthy state, broadcast message fires off gossip to this node, notes what was sent with the msg id
+    // rpc timeout transitions to unhealthy, notes msg_id/value that will be resent as probe, resends
+    // broadcast ok removes pending msg/value pair and adds to seen
+    // in unhealthy state, broadcast message just adds to the backlog. rpc timeout will handle probes elsewhere
+    // rpc timeout checks if it's the nominated probe, if so resends, else adds to backlog
+    // braodcast ok transitions to healthy, sends whole state, notes wat was sent with msg _id
+    // TODO: state message type
     fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    fn accept_broadcast(&mut self, msg: &BroadcastMessagePayload) -> Command {
+        todo!()
     }
 
     // TODO: change name
     async fn transition(
         &mut self,
-        src: impl AsRef<str>,
+        src: impl Into<String>,
         msg: &BroadcastMessagePayload,
         delegate: &mut BroadcastDelegate,
     ) -> Result<(), MaelstromError> {
@@ -190,7 +262,7 @@ impl Neighbor {
 
     async fn die(
         &mut self,
-        src: impl AsRef<str>,
+        src: impl Into<String>,
         msg_id: MessageId,
         delegate: &mut BroadcastDelegate,
     ) -> Result<(), MaelstromError> {
@@ -199,19 +271,19 @@ impl Neighbor {
             NeighborState::Healthy => {
                 // mark as unhealthy, store whatever
                 self.state = NeighborState::Unhealthy;
-                let msg_id = delegate
-                    .rpc_with_timeout(
-                        src,
-                        BroadcastPayload::Broadcast(todo!()),
-                        BROADCAST_TIMEOUT_MS,
-                    )
-                    .await?;
             }
-            NeighborState::Unhealthy => {
-                // dnothing
-                todo!()
-            }
+            NeighborState::Unhealthy => (),
         }
+
+        // Just keep refiring until we hear back.
+        let msg_id = delegate
+            .rpc_with_timeout_with_msg_id(
+                src.into(),
+                BroadcastPayload::Broadcast(todo!()),
+                BROADCAST_TIMEOUT_MS,
+                msg_id,
+            )
+            .await?;
     }
 }
 
@@ -219,7 +291,7 @@ struct BroadcastDelegate {
     msg_tx: UnboundedSender<BroadcastMessage>,
     msg_rx: Option<UnboundedReceiver<BroadcastMessage>>,
     self_tx: UnboundedSender<BroadcastMessage>,
-    outstanding_replies: HashMap<MessageId, String>,
+    outstanding_replies: HashSet<(MessageId, String)>,
 
     node_id: String,
     msg_id: MessageId,
@@ -242,19 +314,7 @@ impl BroadcastDelegate {
             .map(|s| s.to_string())
             .collect();
         for n in neighbors.iter().filter(|n| n.as_str() != src) {
-            // TODO: change names
-            let mut node = self
-                .topology
-                .node_mut(n)
-                .ok_or(MaelstromError::Other(format!(
-                    "Couldn't find node in neighbors: {}",
-                    n
-                )))?;
-            if node.acked(value) {
-                continue;
-            }
-
-            node.transition(src, msg, self).await?;
+            // self.topology.delete_me(Box::new(|| self.next_msg_id()));
         }
 
         Ok(())
@@ -324,7 +384,7 @@ impl NodeDelegate for BroadcastDelegate {
             msg_tx,
             msg_rx: Some(msg_rx),
             self_tx,
-            outstanding_replies: HashMap::new(),
+            outstanding_replies: HashSet::new(),
             node_id: node_id.as_ref().into(),
             msg_id: 0.into(),
             msg_store: MessageStore::new(),
@@ -340,11 +400,11 @@ impl NodeDelegate for BroadcastDelegate {
     }
 
     // TODO: ways to test this -- add cfg(test) code, maybe to wrap get_msg_tx and whatnot, and interpose a snoop channel tehre that you can read
-    fn get_outstanding_replies(&self) -> &HashMap<MessageId, String> {
+    fn get_outstanding_replies(&self) -> &HashSet<(MessageId, String)> {
         &self.outstanding_replies
     }
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<MessageId, String> {
+    fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<(MessageId, String)> {
         &mut self.outstanding_replies
     }
 
@@ -393,20 +453,20 @@ impl NodeDelegate for BroadcastDelegate {
 
     fn handle_local_message(
         &mut self,
-        msg: maelstrom_csp::message::LocalMessage,
+        msg: LocalMessage,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         async move {
-            let (node_id, msg_id) = match msg {
+            let (msg_id, node_id) = match &msg {
                 // TODO: change reply_id to msg_id everywhere
-                maelstrom_csp::message::LocalMessage::Cancel(msg_id) => (
-                    self.outstanding_replies
-                        .remove(&msg_id)
-                        .ok_or(MaelstromError::Other(format!(
+                LocalMessage::Cancel(msg_id, node_id) => {
+                    if !self.outstanding_replies.remove(&(*msg_id, node_id.clone())) {
+                        return Err(MaelstromError::Other(format!(
                             "Couldn't find reply id for message: {:?}",
                             msg
-                        )))?,
-                    msg_id,
-                ),
+                        )));
+                    }
+                    (msg_id, node_id)
+                }
             };
 
             let mut node = self
@@ -416,7 +476,7 @@ impl NodeDelegate for BroadcastDelegate {
                     "Couldn't find node in neighbors: {}",
                     node_id
                 )))?;
-            node.die(&node_id, msg_id, self).await?;
+            //node.die(&node_id, msg_id, self).await?;
 
             Ok(())
         }

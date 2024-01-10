@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     future::Future,
     time::Duration,
     {fmt::Display, marker::PhantomData},
@@ -33,22 +33,23 @@ pub trait NodeDelegate {
         async { Ok(()) }
     }
 
-    // TODO: use newtypes for ids
-    fn get_outstanding_replies(&self) -> &HashMap<MessageId, String>;
+    fn get_outstanding_replies(&self) -> &HashSet<(MessageId, String)>;
 
-    fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<MessageId, String>;
+    fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<(MessageId, String)>;
 
-    fn is_expecting_reply(&self, msg_id: MessageId) -> bool {
-        self.get_outstanding_replies().contains_key(&msg_id)
+    fn is_expecting_reply(&self, msg_id: MessageId, node: impl Into<String>) -> bool {
+        self.get_outstanding_replies()
+            .contains(&(msg_id, node.into()))
     }
 
-    fn expect_reply(&mut self, msg_id: MessageId, node_id: impl AsRef<str>) {
+    fn expect_reply(&mut self, msg_id: MessageId, node_id: impl Into<String>) {
         self.get_outstanding_replies_mut()
-            .insert(msg_id, node_id.as_ref().into());
+            .insert((msg_id, node_id.into()));
     }
 
-    fn cancel_reply(&mut self, msg_id: MessageId) {
-        self.get_outstanding_replies_mut().remove(&msg_id);
+    fn cancel_reply(&mut self, msg_id: MessageId, node: impl Into<String>) {
+        self.get_outstanding_replies_mut()
+            .remove(&(msg_id, node.into()));
     }
 
     fn receive_reply(
@@ -63,7 +64,7 @@ pub trait NodeDelegate {
                 "Reply missing in_reply_to: {:?}",
                 reply
             )))?;
-            if self.is_expecting_reply(in_reply_to) {
+            if self.is_expecting_reply(in_reply_to, reply.src.clone().unwrap()) {
                 return self.handle_reply(reply).await;
             }
             info!("Got unexpected reply: {:?}", reply);
@@ -77,8 +78,8 @@ pub trait NodeDelegate {
         msg: LocalMessage,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         match msg {
-            LocalMessage::Cancel(reply_id) => {
-                self.cancel_reply(reply_id);
+            LocalMessage::Cancel(reply_id, node) => {
+                self.cancel_reply(reply_id, node);
             }
         }
         async { Ok(()) }
@@ -257,26 +258,26 @@ pub trait NodeDelegate {
 
     fn rpc_with_timeout(
         &mut self,
-        dest: impl AsRef<str>,
+        dest: impl Into<String>,
         contents: Self::MessageType,
         duration: u64,
     ) -> impl Future<Output = Result<MessageId, MaelstromError>> + Send {
         let msg_id = self.next_msg_id();
 
-        self.rpc_with_timeout_with_msg_id(dest, contents, duration, msg_id)
+        self.rpc_with_timeout_with_msg_id(dest.into(), contents, duration, msg_id)
             .map(move |r| r.map(move |_| msg_id))
     }
 
     fn rpc_with_timeout_with_msg_id(
         &mut self,
-        dest: impl AsRef<str>,
+        dest: String,
         contents: Self::MessageType,
         duration: u64,
         msg_id: MessageId,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         let msg_tx = self.get_self_tx();
         self.sync_rpc_with_msg_id(
-            dest,
+            dest.clone(),
             contents,
             Box::new(move |reply_id| {
                 Box::new(async move {
@@ -288,7 +289,7 @@ pub trait NodeDelegate {
                         body: MessageBody {
                             msg_id: None,
                             in_reply_to: None,
-                            local_msg: Some(LocalMessage::Cancel(reply_id)),
+                            local_msg: Some(LocalMessage::Cancel(reply_id, dest.into())),
                             contents: Self::MessageType::default(),
                         },
                     });
@@ -521,6 +522,8 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     use serde::{Deserialize, Serialize};
@@ -647,16 +650,16 @@ mod tests {
         let (mut delegate, _, _) = get_delegate_and_channels();
         delegate
             .get_outstanding_replies_mut()
-            .insert(1.into(), "".into());
+            .insert((1.into(), "".into()));
 
         if let Err(e) = delegate
-            .handle_local_message(LocalMessage::Cancel(1.into()))
+            .handle_local_message(LocalMessage::Cancel(1.into(), "".into()))
             .await
         {
             panic!("Got error: {}", e);
         }
 
-        assert!(!delegate.is_expecting_reply(1.into()));
+        assert!(!delegate.is_expecting_reply(1.into(), ""));
     }
 
     type TestMessage = Message<TestPayload>;
@@ -705,7 +708,7 @@ mod tests {
         msg_rx: Option<UnboundedReceiver<Message<TestPayload>>>,
 
         msg_id: MessageId,
-        outstanding_replies: HashMap<MessageId, String>,
+        outstanding_replies: HashSet<(MessageId, String)>,
     }
 
     impl NodeDelegate for TestDelegate {
@@ -722,7 +725,7 @@ mod tests {
                 msg_tx,
                 msg_rx: Some(msg_rx),
                 msg_id: 0.into(),
-                outstanding_replies: HashMap::new(),
+                outstanding_replies: HashSet::new(),
             }
         }
 
@@ -746,11 +749,11 @@ mod tests {
             }
         }
 
-        fn get_outstanding_replies(&self) -> &HashMap<MessageId, String> {
+        fn get_outstanding_replies(&self) -> &HashSet<(MessageId, String)> {
             &self.outstanding_replies
         }
 
-        fn get_outstanding_replies_mut(&mut self) -> &mut HashMap<MessageId, String> {
+        fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<(MessageId, String)> {
             &mut self.outstanding_replies
         }
 
