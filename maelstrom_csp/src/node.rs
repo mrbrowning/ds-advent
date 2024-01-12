@@ -504,6 +504,7 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
             if dest != self.node_id {
                 // It's outgoing from the delegate, rewrite the source with our ID and send it on the wire.
                 msg.src = Some(self.node_id.clone());
+                info!("Sent: {:?}", msg);
                 send!(self.egress_tx, msg, "Message egress hung up: {}");
 
                 continue;
