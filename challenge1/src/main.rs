@@ -7,6 +7,7 @@ use maelstrom_csp::{
     rpc_error::MaelstromError,
     send,
 };
+use message_macro::maelstrom_message;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{stdin, stdout, BufReader},
@@ -20,6 +21,21 @@ const SEQUENCE_ID_BITS: i64 = 12;
 const SEQUENCE_ID_CEILING: u64 = 1 << SEQUENCE_ID_BITS;
 
 const HIGH_ORDER_MASK: u64 = !(1 << 63);
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct GenerateOkPayload {
+    id: String,
+}
+
+#[maelstrom_message]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+enum UniqueIdPayload {
+    #[serde(rename = "generate")]
+    Generate,
+
+    #[serde(rename = "generate_ok")]
+    GenerateOk(GenerateOkPayload),
+}
 
 #[derive(Debug)]
 struct Generator {
@@ -107,55 +123,6 @@ fn get_node_id(node_name: impl AsRef<str>, node_list: &Vec<String>) -> Result<u1
     let truncated = index.try_into()?;
 
     Ok(truncated)
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct GenerateOkPayload {
-    id: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
-enum UniqueIdPayload {
-    #[serde(rename = "generate")]
-    Generate,
-
-    #[serde(rename = "generate_ok")]
-    GenerateOk(GenerateOkPayload),
-
-    #[serde(rename = "init")]
-    Init(InitMessagePayload),
-
-    #[serde(rename = "init_ok")]
-    InitOk,
-
-    #[serde(rename = "error")]
-    Error(ErrorMessagePayload),
-
-    Empty,
-}
-
-impl Default for UniqueIdPayload {
-    fn default() -> Self {
-        Self::Empty
-    }
-}
-
-impl MessagePayload for UniqueIdPayload {
-    fn as_init_msg(&self) -> Option<InitMessagePayload> {
-        match self {
-            UniqueIdPayload::Init(m) => Some(m.clone()),
-            _ => None,
-        }
-    }
-
-    fn to_init_ok_msg() -> Self {
-        Self::InitOk
-    }
-
-    fn to_err_msg(err: ErrorMessagePayload) -> Self {
-        Self::Error(err)
-    }
 }
 
 struct UniqueIdDelegate {

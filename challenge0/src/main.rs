@@ -13,53 +13,21 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
 
+use message_macro::maelstrom_message;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct EchoRequestPayload {
     echo: String,
 }
 
+#[maelstrom_message]
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
 enum EchoPayload {
     #[serde(rename = "echo")]
     Echo(EchoRequestPayload),
 
     #[serde(rename = "echo_ok")]
     EchoOk(EchoRequestPayload),
-
-    #[serde(rename = "init")]
-    Init(InitMessagePayload),
-
-    #[serde(rename = "init_ok")]
-    InitOk,
-
-    #[serde(rename = "error")]
-    Error(ErrorMessagePayload),
-
-    Empty,
-}
-
-impl Default for EchoPayload {
-    fn default() -> Self {
-        Self::Empty
-    }
-}
-
-impl MessagePayload for EchoPayload {
-    fn as_init_msg(&self) -> Option<InitMessagePayload> {
-        match self {
-            EchoPayload::Init(m) => Some(m.clone()),
-            _ => None,
-        }
-    }
-
-    fn to_init_ok_msg() -> Self {
-        Self::InitOk
-    }
-
-    fn to_err_msg(err: ErrorMessagePayload) -> Self {
-        Self::Error(err)
-    }
 }
 
 struct EchoDelegate {

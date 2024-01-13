@@ -24,6 +24,8 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
 
+use message_macro::maelstrom_message;
+
 const BROADCAST_TIMEOUT_MS: u64 = 5000;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -46,8 +48,8 @@ struct TopologyPayload {
     topology: HashMap<String, Vec<String>>,
 }
 
+#[maelstrom_message]
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type")]
 enum ChallengePayload {
     #[serde(rename = "broadcast")]
     Broadcast(BroadcastPayload),
@@ -67,45 +69,11 @@ enum ChallengePayload {
     #[serde(rename = "topology_ok")]
     TopologyOk,
 
-    #[serde(rename = "init")]
-    Init(InitMessagePayload),
-
-    #[serde(rename = "init_ok")]
-    InitOk,
-
-    #[serde(rename = "error")]
-    Error(ErrorMessagePayload),
-
     #[serde(rename = "state")]
     AllMessages(AllMessagePayload),
 
     #[serde(rename = "state_ok")]
     AllMessagesOk,
-
-    Empty,
-}
-
-impl Default for ChallengePayload {
-    fn default() -> Self {
-        Self::Empty
-    }
-}
-
-impl MessagePayload for ChallengePayload {
-    fn as_init_msg(&self) -> Option<InitMessagePayload> {
-        match self {
-            ChallengePayload::Init(m) => Some(m.clone()),
-            _ => None,
-        }
-    }
-
-    fn to_init_ok_msg() -> Self {
-        Self::InitOk
-    }
-
-    fn to_err_msg(err: ErrorMessagePayload) -> Self {
-        Self::Error(err)
-    }
 }
 
 type ChallengeMessage = Message<ChallengePayload>;
@@ -323,7 +291,14 @@ impl StateManager for NeighborState<Healthy> {
         msg: &AllMessagePayload,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // We got a state message from someone else, gossip about it to this node if there's anything it hasn't seen.
-        if msg.messages.iter().filter(|m| !self.acked(**m)).collect::<Vec<_>>().len() == 0 {
+        if msg
+            .messages
+            .iter()
+            .filter(|m| !self.acked(**m))
+            .collect::<Vec<_>>()
+            .len()
+            == 0
+        {
             return (self, Command::RestEasy);
         }
 
@@ -430,7 +405,14 @@ impl StateManager for NeighborState<Unhealthy> {
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // We got a state update from someone else while this node was unhealthy. Add it to the backlog and move on, the
         // heartbeat we're sending will take care of things when this node comes back online.
-        if msg.messages.iter().filter(|m| !self.acked(**m)).collect::<Vec<_>>().len() == 0 {
+        if msg
+            .messages
+            .iter()
+            .filter(|m| !self.acked(**m))
+            .collect::<Vec<_>>()
+            .len()
+            == 0
+        {
             return (self, Command::RestEasy);
         }
         self.backlog.extend(msg.messages.clone().into_iter());
