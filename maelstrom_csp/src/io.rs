@@ -59,7 +59,7 @@ impl<M: Serialize> Egress<M> {
             let mut buf = serde_json::to_string(&out)?;
 
             buf.push('\n');
-            self.writer.write_all(&buf.as_bytes()).await?;
+            self.writer.write_all(buf.as_bytes()).await?;
         }
     }
 

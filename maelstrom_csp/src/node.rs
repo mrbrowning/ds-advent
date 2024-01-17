@@ -129,11 +129,8 @@ pub trait NodeDelegate {
         request: Message<Self::MessageType>,
         err: MaelstromError,
     ) -> Result<(), MaelstromError> {
-        match err {
-            MaelstromError::ChannelError(_) => {
-                return Err(err);
-            }
-            _ => (),
+        if let MaelstromError::ChannelError(_) = err {
+            return Err(err);
         }
 
         match self.reply(
@@ -158,7 +155,7 @@ pub trait NodeDelegate {
         Message {
             src: None,
             dest: dest.map(|d| d.as_ref().into()),
-            body: body,
+            body,
         }
     }
 
@@ -289,7 +286,7 @@ pub trait NodeDelegate {
                         body: MessageBody {
                             msg_id: None,
                             in_reply_to: None,
-                            local_msg: Some(LocalMessage::Cancel(reply_id, dest.into())),
+                            local_msg: Some(LocalMessage::Cancel(reply_id, dest)),
                             contents: Self::MessageType::default(),
                         },
                     });
@@ -315,9 +312,8 @@ pub trait NodeDelegate {
     {
         async {
             if let Err(e) = self.on_start().await {
-                match e {
-                    MaelstromError::ChannelError(_) => return Err(e),
-                    _ => (),
+                if let MaelstromError::ChannelError(_) = e {
+                    return Err(e);
                 }
             }
 
@@ -339,10 +335,8 @@ pub trait NodeDelegate {
                     if let Err(e) = self.receive_reply(msg.clone()).await {
                         self.handle_err(msg, e)?;
                     }
-                } else {
-                    if let Err(e) = self.handle_message(msg.clone()).await {
-                        self.handle_err(msg, e)?;
-                    }
+                } else if let Err(e) = self.handle_message(msg.clone()).await {
+                    self.handle_err(msg, e)?;
                 }
             }
         }
@@ -459,8 +453,8 @@ impl<M: MessagePayload + Send, D: NodeDelegate<MessageType = M> + Send> Node<M, 
         Self {
             delegate: Some(delegate),
             delegate_tx,
-            node_id: node_id,
-            node_ids: node_ids.into(),
+            node_id,
+            node_ids,
             ingress_rx,
             egress_tx,
         }
@@ -730,6 +724,7 @@ mod tests {
             }
         }
 
+        #[allow(clippy::manual_async_fn)]
         fn on_start(&mut self) -> impl Future<Output = Result<(), MaelstromError>> + Send {
             async move {
                 let msg_tx = self.get_msg_tx();
@@ -758,6 +753,7 @@ mod tests {
             &mut self.outstanding_replies
         }
 
+        #[allow(clippy::manual_async_fn)]
         fn handle_reply(
             &mut self,
             _: Message<Self::MessageType>,
@@ -765,6 +761,7 @@ mod tests {
             async { panic!("Reply should have been ignored") }
         }
 
+        #[allow(clippy::manual_async_fn)]
         fn handle_message(
             &mut self,
             _: Message<Self::MessageType>,

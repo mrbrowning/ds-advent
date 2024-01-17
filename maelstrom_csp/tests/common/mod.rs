@@ -31,7 +31,7 @@ impl AsyncRead for AsyncChannelReader {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(msg)) => {
-                buf.put_slice(&msg.as_bytes());
+                buf.put_slice(msg.as_bytes());
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => Poll::Pending,

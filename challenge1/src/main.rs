@@ -181,6 +181,7 @@ impl NodeDelegate for UniqueIdDelegate {
         &mut self.outstanding_replies
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_reply(
         &mut self,
         _: Message<Self::MessageType>,
@@ -189,6 +190,7 @@ impl NodeDelegate for UniqueIdDelegate {
         async { Ok(()) }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_message(
         &mut self,
         message: Message<Self::MessageType>,
@@ -349,7 +351,7 @@ mod tests {
         let sequence_mask: u64 = !((1 << 12) - 1);
         let mask = time_mask & sequence_mask;
 
-        assert_eq!(generator.get_next_id() & mask, (1023 as u64) << 12);
+        assert_eq!(generator.get_next_id() & mask, 1023_u64 << 12);
     }
 
     #[test]

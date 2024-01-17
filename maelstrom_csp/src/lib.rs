@@ -13,6 +13,7 @@ pub mod rpc_error;
 pub mod types;
 pub mod util;
 
+#[allow(clippy::type_complexity)]
 pub fn get_node_and_io<
     M: message::MessagePayload + Send + Serialize + for<'de> Deserialize<'de>,
     D: node::NodeDelegate<MessageType = M> + Send,

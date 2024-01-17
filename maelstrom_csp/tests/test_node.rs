@@ -243,6 +243,7 @@ async fn test_node_ignores_unexpected_reply() {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn get_node_and_channels<D: NodeDelegate<MessageType = EchoPayload> + Send>() -> (
     Node<EchoPayload, D>,
     UnboundedSender<Message<EchoPayload>>,
@@ -297,6 +298,7 @@ impl NodeDelegate for EchoDelegate {
         todo!()
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_reply(
         &mut self,
         _: Message<Self::MessageType>,
@@ -304,21 +306,19 @@ impl NodeDelegate for EchoDelegate {
         async move { Ok(()) }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_message(
         &mut self,
         message: Message<Self::MessageType>,
     ) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send {
         async move {
             let msg_tx = self.get_msg_tx();
-            match message.body.contents {
-                EchoPayload::Echo => {
-                    send!(
-                        msg_tx,
-                        self.reply(message, EchoPayload::EchoOk)?,
-                        "Egress hung up: {}"
-                    );
-                }
-                _ => (),
+            if let EchoPayload::Echo = message.body.contents {
+                send!(
+                    msg_tx,
+                    self.reply(message, EchoPayload::EchoOk)?,
+                    "Egress hung up: {}"
+                );
             }
 
             Ok(())
@@ -380,6 +380,7 @@ impl NodeDelegate for RpcDelegate {
         &mut self.outstanding_replies
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_reply(
         &mut self,
         _: Message<Self::MessageType>,
@@ -404,6 +405,7 @@ impl NodeDelegate for RpcDelegate {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_message(
         &mut self,
         message: Message<Self::MessageType>,
@@ -414,15 +416,12 @@ impl NodeDelegate for RpcDelegate {
                 "Missing destination: {:?}",
                 message
             )))?;
-            match message.body.contents {
-                EchoPayload::Echo => {
-                    send!(
-                        msg_tx,
-                        self.rpc(src, EchoPayload::EchoOk),
-                        "Egress hung up: {}"
-                    );
-                }
-                _ => (),
+            if let EchoPayload::Echo = message.body.contents {
+                send!(
+                    msg_tx,
+                    self.rpc(src, EchoPayload::EchoOk),
+                    "Egress hung up: {}"
+                );
             }
 
             Ok(())

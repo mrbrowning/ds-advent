@@ -68,6 +68,7 @@ impl NodeDelegate for EchoDelegate {
         &mut self.outstanding_replies
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_reply(
         &mut self,
         _: Message<Self::MessageType>,
@@ -75,18 +76,16 @@ impl NodeDelegate for EchoDelegate {
         async { Ok(()) }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_message(
         &mut self,
         message: Message<Self::MessageType>,
     ) -> impl std::future::Future<Output = Result<(), MaelstromError>> + Send {
         async {
             let msg_tx = self.get_msg_tx();
-            match message.clone().body.contents {
-                EchoPayload::Echo(e) => {
-                    let contents = EchoPayload::EchoOk(e);
-                    send!(msg_tx, self.reply(message, contents)?, "Egress hung up: {}");
-                }
-                _ => (),
+            if let EchoPayload::Echo(e) = message.clone().body.contents {
+                let contents = EchoPayload::EchoOk(e);
+                send!(msg_tx, self.reply(message, contents)?, "Egress hung up: {}");
             }
 
             Ok(())
