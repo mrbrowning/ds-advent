@@ -1,18 +1,15 @@
-#![allow(unused)]
-
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
-    hash::Hash,
     marker::PhantomData,
+    ops::Deref,
 };
 
 use log::{error, info, warn};
 use maelstrom_csp::{
     get_node_and_io,
     message::{
-        self, ErrorMessagePayload, InitMessagePayload, LocalMessage, Message, MessageBody,
-        MessageId, MessagePayload,
+        ErrorMessagePayload, InitMessagePayload, LocalMessage, Message, MessageId, MessagePayload,
     },
     node::NodeDelegate,
     rpc_error::MaelstromError,
@@ -26,7 +23,8 @@ use tokio::{
 
 use message_macro::maelstrom_message;
 
-const BROADCAST_TIMEOUT_MS: u64 = 5000;
+const BROADCAST_TIMEOUT_MS: u64 = 1000;
+const BRANCHING_FACTOR: u64 = 4;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 struct BroadcastPayload {
@@ -78,6 +76,11 @@ enum ChallengePayload {
 
 type ChallengeMessage = Message<ChallengePayload>;
 
+// Implement neighbors as state machines with two states, healthy and unhealthy. While it would simplify the logic of
+// the accept methods and would move more of the burden of guaranteeing correctness into the type system if we used more
+// granular states, e.g. a PendingBroadcastResponse state, this would either force us to serialize every pair of
+// requests and responses (so no multiple outstanding messages) or require a combinatorial explosion of states modeling
+// all possible combinations of outstanding messages up to some arbitrary bound, neither of which is practical.
 trait NeighborHealth {}
 struct Healthy {}
 struct Unhealthy {}
@@ -169,7 +172,7 @@ where
     }
 
     fn accept_timeout_impl(
-        mut self: Box<Self>,
+        self: Box<Self>,
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         if self.pending.contains_key(&msg_id)
@@ -213,15 +216,15 @@ impl StateManager for NeighborState<Healthy> {
         mut self: Box<Self>,
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
-        // Our last braodcast timed out. Transition to unhealthy, put everything not acked in the backlog, resend as a
+        // Our last broadcast timed out. Transition to unhealthy, put everything not acked in the backlog, resend as a
         // heartbeat.
         let message = self.pending.remove(&msg_id).unwrap();
         let mut backlog: HashSet<i64> = HashSet::new();
-        backlog.extend(self.pending.values().into_iter());
+        backlog.extend(self.pending.values());
 
         // A possible ordering of incoming messages is that we get this timeout after having sent a state message,
         // so make sure to save this too.
-        backlog.extend(self.pending_all_msgs.unwrap_or_default().into_iter());
+        backlog.extend(self.pending_all_msgs.unwrap_or_default());
 
         let next_state: NeighborState<Unhealthy> = NeighborState {
             pending: BTreeMap::new(),
@@ -238,7 +241,7 @@ impl StateManager for NeighborState<Healthy> {
 
     fn accept_state_timeout(
         mut self: Box<Self>,
-        msg: MessageId,
+        _: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // This node was briefly healthy, but our state message timed out. Transition to unhealthy and pick out a value
         // to send as a heartbeat.
@@ -252,7 +255,7 @@ impl StateManager for NeighborState<Healthy> {
             (msg_id, message) = self.pending.pop_first().unwrap();
 
             // In case broadcasts were sent while this node was healthy but waiting to get a AllMessagesOk response.
-            backlog.extend(self.pending.values().into_iter());
+            backlog.extend(self.pending.values());
         } else {
             // Nominate one of the values from the state we tried to send out as the heartbeat.
             msg_id = self.next_msg_id();
@@ -260,7 +263,7 @@ impl StateManager for NeighborState<Healthy> {
                 .pop()
                 .expect("State we sent out was empty, so it shouldn't have been sent");
         }
-        backlog.extend(all_msg_contents.into_iter());
+        backlog.extend(all_msg_contents);
 
         let next_state: NeighborState<Unhealthy> = NeighborState {
             pending: BTreeMap::new(),
@@ -296,25 +299,24 @@ impl StateManager for NeighborState<Healthy> {
             .iter()
             .filter(|m| !self.acked(**m))
             .collect::<Vec<_>>()
-            .len()
-            == 0
+            .is_empty()
         {
             return (self, Command::RestEasy);
         }
 
         let msg_id = self.next_msg_id();
-        self.pending_all_msgs.insert(msg.messages.clone());
+        let _ = self.pending_all_msgs.insert(msg.messages.clone());
 
         (self, Command::AllMessages(msg_id, msg.messages.clone()))
     }
 
     fn accept_state_ok(
         mut self: Box<Self>,
-        msg_id: MessageId,
+        _: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // Our state message got acked, make note of that and move on.
         let messages = self.pending_all_msgs.take().unwrap();
-        self.acked.extend(messages.into_iter());
+        self.acked.extend(messages);
 
         (self, Command::RestEasy)
     }
@@ -347,7 +349,7 @@ impl StateManager for NeighborState<Unhealthy> {
     }
 
     fn accept_broadcast_timeout(
-        mut self: Box<Self>,
+        self: Box<Self>,
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // Our heartbeat to this node timed out. Resend.
@@ -363,7 +365,7 @@ impl StateManager for NeighborState<Unhealthy> {
 
     fn accept_state_timeout(
         self: Box<Self>,
-        msg_id: MessageId,
+        _: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // An unlikely possibility, but if a node has transitioned from unhealthy to healthy, sent a state message,
         // then sent a broadcast very soon after while it was healthy but the state response was pending, those timeout
@@ -379,8 +381,8 @@ impl StateManager for NeighborState<Unhealthy> {
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // Our heartbeat was acked! Transition back to healthy and send a state catchup message out.
         let all_msg_contents: Vec<i64> = self.backlog.into_iter().collect();
-        let command = if all_msg_contents.len() > 0 {
-            self.pending_all_msgs.insert(all_msg_contents.clone());
+        let command = if !all_msg_contents.is_empty() {
+            let _ = self.pending_all_msgs.insert(all_msg_contents.clone());
             Command::AllMessages(msg_id, all_msg_contents)
         } else {
             Command::RestEasy
@@ -410,19 +412,18 @@ impl StateManager for NeighborState<Unhealthy> {
             .iter()
             .filter(|m| !self.acked(**m))
             .collect::<Vec<_>>()
-            .len()
-            == 0
+            .is_empty()
         {
             return (self, Command::RestEasy);
         }
-        self.backlog.extend(msg.messages.clone().into_iter());
+        self.backlog.extend(msg.messages.clone());
 
         (self, Command::RestEasy)
     }
 
     fn accept_state_ok(
         self: Box<Self>,
-        msg_id: MessageId,
+        _: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // Basically the same situation as accept_state_timeout: if we send out a state message and then a broadcast in
         // quick succession, and the state response just barely squeaks through before the timeout but the broadcast
@@ -443,6 +444,103 @@ struct Neighbor {
     node_id: String,
 }
 
+trait Topology {
+    fn neighbors(&self, node_ids: &[String], node_id: &str) -> Vec<String>;
+}
+
+impl<T: Deref<Target = dyn Topology + Send>> Topology for T {
+    fn neighbors(&self, node_ids: &[String], node_id: &str) -> Vec<String> {
+        self.deref().neighbors(node_ids, node_id)
+    }
+}
+
+struct RingTopology {}
+
+impl Topology for RingTopology {
+    fn neighbors(&self, node_ids: &[String], node_id: &str) -> Vec<String> {
+        for (i, n) in node_ids.iter().enumerate() {
+            if (n.as_str() == node_id) && (i < node_ids.len() - 1) {
+                return vec![node_ids[i + 1].clone()];
+            } else if (n.as_str() == node_id) && (i == node_ids.len() - 1) {
+                return vec![node_ids[0].clone()];
+            }
+        }
+
+        panic!("{} not in node_ids: {:?}", node_id, node_ids);
+    }
+}
+
+struct TreeTopology {
+    branching_factor: u64,
+}
+
+impl TreeTopology {
+    fn new(branching_factor: u64) -> Self {
+        Self { branching_factor }
+    }
+
+    fn spanning_tree(
+        num_nodes: usize,
+        this_node: usize,
+        branching_factor: u64,
+    ) -> (Option<usize>, Vec<usize>) {
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        queue.push_back(0);
+
+        let mut remaining: VecDeque<usize> = VecDeque::new();
+        remaining.extend(1..num_nodes);
+        let mut parent: Option<usize> = None;
+        while !queue.is_empty() {
+            let current = queue.pop_front().unwrap();
+            let mut children: Vec<usize> = Vec::new();
+
+            for _ in 0..branching_factor as usize {
+                if !remaining.is_empty() {
+                    let child = remaining.pop_front().unwrap();
+                    if child == this_node {
+                        parent = Some(current);
+                    }
+
+                    children.push(child);
+                } else {
+                    break;
+                }
+            }
+
+            if current == this_node {
+                return (parent, children);
+            } else {
+                queue.extend(children);
+            }
+        }
+
+        panic!("{} not traversed", this_node);
+    }
+}
+
+impl Topology for TreeTopology {
+    fn neighbors(&self, node_ids: &[String], node_id: &str) -> Vec<String> {
+        let node_index = node_ids
+            .iter()
+            .enumerate()
+            .find(|n| n.1 == node_id)
+            .unwrap()
+            .0;
+        let (parent, neighbor_indexes) =
+            Self::spanning_tree(node_ids.len(), node_index, self.branching_factor);
+
+        let mut neighbors: Vec<String> = neighbor_indexes
+            .iter()
+            .map(|i| node_ids[*i].clone())
+            .collect();
+        if let Some(parent) = parent {
+            neighbors.push(node_ids[parent].clone());
+        }
+
+        neighbors
+    }
+}
+
 impl Neighbor {
     fn new(node_id: impl AsRef<str>) -> Self {
         let state_machine: NeighborState<Healthy> = NeighborState::new();
@@ -458,7 +556,7 @@ impl Neighbor {
     }
 
     fn accept_message(&mut self, msg: &ChallengeMessage) -> Command {
-        let mut neighbor_state = self.neighbor_state.take().unwrap();
+        let neighbor_state = self.neighbor_state.take().unwrap();
 
         let (state, command) = match &msg.body.contents {
             ChallengePayload::Broadcast(b) => neighbor_state.accept_broadcast(b),
@@ -475,56 +573,47 @@ impl Neighbor {
                 panic!("Unexpected message in handle_reply: {:?}", msg);
             }
         };
-        self.neighbor_state.insert(state);
+        let _ = self.neighbor_state.insert(state);
 
         command
     }
 
     fn accept_timeout(&mut self, msg_id: MessageId) -> Command {
-        let mut neighbor_state = self.neighbor_state.take().unwrap();
+        let neighbor_state = self.neighbor_state.take().unwrap();
         let (state, command) = neighbor_state.accept_timeout(msg_id);
-        self.neighbor_state.insert(state);
+        let _ = self.neighbor_state.insert(state);
 
         command
     }
 
+    #[allow(dead_code)]
     fn acked(&self, message: i64) -> bool {
         self.neighbor_state.as_ref().unwrap().acked(message)
     }
 }
 
-struct Neighbors {
+struct Neighbors<T: Topology + Send> {
+    #[allow(dead_code)]
+    topology: T,
     neighbors: HashMap<String, Neighbor>,
 }
 
-impl Neighbors {
-    fn new(neighbors: impl Iterator<Item = String>) -> Self {
+impl<T: Topology + Send> Neighbors<T> {
+    fn new(all_nodes: &[String], node_id: &str, topology: T) -> Self {
+        let neighbors: HashMap<String, Neighbor> = topology
+            .neighbors(all_nodes, node_id)
+            .iter()
+            .map(|n| (n.clone(), Neighbor::new(n)))
+            .collect();
+
         Self {
-            neighbors: neighbors.map(|n| (n.clone(), Neighbor::new(n))).collect(),
+            topology,
+            neighbors,
         }
     }
 
     fn iter_mut(&mut self) -> impl Iterator<Item = &mut Neighbor> {
         self.neighbors.values_mut()
-    }
-
-    fn set_neighbors(&mut self, neighbors: &[String]) {
-        let new_neighbor_ids: HashSet<String> = neighbors.iter().map(|s| s.clone()).collect();
-        let current_neighbor_ids: HashSet<String> =
-            self.neighbors.keys().map(|s| s.into()).collect();
-        for n in new_neighbor_ids.iter() {
-            if !current_neighbor_ids.contains(n) {
-                self.neighbors.insert(n.clone(), Neighbor::new(n));
-            }
-        }
-
-        let to_remove: Vec<String> = self
-            .neighbors
-            .keys()
-            .filter(|n| !new_neighbor_ids.contains(*n))
-            .map(|s| s.into())
-            .collect();
-        to_remove.iter().map(|n| self.neighbors.remove(n));
     }
 
     fn node_mut(&mut self, name: &str) -> Option<&mut Neighbor> {
@@ -538,27 +627,16 @@ struct BroadcastDelegate {
     self_tx: UnboundedSender<ChallengeMessage>,
     outstanding_replies: HashSet<(MessageId, String)>,
 
+    #[allow(dead_code)]
     node_id: String,
     msg_id: MessageId,
 
     msg_store: HashSet<i64>,
-    neighbors: Neighbors,
+    neighbors: Neighbors<Box<dyn Topology + Send>>,
 }
 
 impl BroadcastDelegate {
-    fn handle_topology(
-        &mut self,
-        msg: &TopologyPayload,
-    ) -> Result<ChallengePayload, MaelstromError> {
-        let neighbors = msg
-            .topology
-            .get(&self.node_id)
-            .ok_or(MaelstromError::Other(format!(
-                "Didn't find self ({}) in neighbors: {:?}",
-                self.node_id, msg
-            )))?;
-        self.neighbors.set_neighbors(neighbors.as_slice());
-
+    fn handle_topology(&mut self, _: &TopologyPayload) -> Result<ChallengePayload, MaelstromError> {
         Ok(ChallengePayload::TopologyOk)
     }
 
@@ -614,11 +692,9 @@ impl NodeDelegate for BroadcastDelegate {
             msg_id: 0.into(),
             msg_store: HashSet::new(),
             neighbors: Neighbors::new(
-                node_ids
-                    .as_ref()
-                    .iter()
-                    .filter(|n| n.as_str() != node_id.as_ref())
-                    .map(|s| s.clone()),
+                node_ids.as_ref(),
+                node_id.as_ref(),
+                Box::new(TreeTopology::new(BRANCHING_FACTOR)),
             ),
         }
     }
@@ -631,6 +707,7 @@ impl NodeDelegate for BroadcastDelegate {
         &mut self.outstanding_replies
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_reply(
         &mut self,
         reply: ChallengeMessage,
@@ -669,16 +746,15 @@ impl NodeDelegate for BroadcastDelegate {
             }
 
             if defer_to_state_machine {
-                let msg_id = reply.body.in_reply_to.unwrap();
                 let node_id = reply.src.as_ref().unwrap().to_string();
                 let command = {
-                    let mut node =
-                        self.neighbors
-                            .node_mut(&node_id)
-                            .ok_or(MaelstromError::Other(format!(
-                                "Couldn't find node in neighbors: {}",
-                                node_id
-                            )))?;
+                    let node = self
+                        .neighbors
+                        .node_mut(&node_id)
+                        .ok_or(MaelstromError::Other(format!(
+                            "Couldn't find node in neighbors: {}",
+                            node_id
+                        )))?;
 
                     node.accept_message(&reply)
                 };
@@ -690,12 +766,12 @@ impl NodeDelegate for BroadcastDelegate {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_message(
         &mut self,
         message: ChallengeMessage,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         async move {
-            let response: ChallengePayload;
             let mut defer_to_state_machine = false;
             match &message.body.contents {
                 ChallengePayload::Broadcast(b) => {
@@ -711,12 +787,12 @@ impl NodeDelegate for BroadcastDelegate {
                     );
                 }
                 ChallengePayload::AllMessages(s) => {
-                    if s.messages
+                    if !s
+                        .messages
                         .iter()
                         .filter(|m| !self.msg_store.contains(*m))
                         .collect::<Vec<_>>()
-                        .len()
-                        > 0
+                        .is_empty()
                     {
                         // Rely on idempotence to be lazy here and not filter out the messages we've already seen.
                         defer_to_state_machine = true;
@@ -730,7 +806,7 @@ impl NodeDelegate for BroadcastDelegate {
                 }
 
                 ChallengePayload::Topology(t) => {
-                    let response = self.handle_topology(&t)?;
+                    let response = self.handle_topology(t)?;
                     send!(
                         self.get_msg_tx(),
                         self.reply(message.clone(), response)?,
@@ -741,7 +817,7 @@ impl NodeDelegate for BroadcastDelegate {
                     let reply = self.reply(
                         message.clone(),
                         ChallengePayload::ReadOk(ReadOkPayload {
-                            messages: self.msg_store.iter().map(|m| *m).collect(),
+                            messages: self.msg_store.iter().copied().collect(),
                         }),
                     )?;
                     send!(self.get_msg_tx(), reply, "Egress hung up: {}");
@@ -771,6 +847,7 @@ impl NodeDelegate for BroadcastDelegate {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn handle_local_message(
         &mut self,
         msg: LocalMessage,
@@ -789,9 +866,9 @@ impl NodeDelegate for BroadcastDelegate {
             };
 
             let command = {
-                let mut node = self
+                let node = self
                     .neighbors
-                    .node_mut(&node_id)
+                    .node_mut(node_id)
                     .ok_or(MaelstromError::Other(format!(
                         "Couldn't find node in neighbors: {}",
                         node_id
