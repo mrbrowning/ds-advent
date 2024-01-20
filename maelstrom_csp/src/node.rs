@@ -11,8 +11,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::{
     message::{
-        ErrorMessagePayload, InitMessagePayload, LocalMessage, Message, MessageBody, MessageId,
-        MessagePayload,
+        ErrorMessagePayload, InitMessagePayload, LocalMessage, LocalMessageType, Message,
+        MessageBody, MessageId, MessagePayload,
     },
     rpc_error::{ErrorType, MaelstromError, RPCError},
     send,
@@ -77,10 +77,8 @@ pub trait NodeDelegate {
         &mut self,
         msg: LocalMessage,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
-        match msg {
-            LocalMessage::Cancel(reply_id, node) => {
-                self.cancel_reply(reply_id, node);
-            }
+        if let LocalMessageType::Cancel = msg.msg_type {
+            self.cancel_reply(msg.msg_id, msg.node_id);
         }
         async { Ok(()) }
     }
@@ -286,7 +284,11 @@ pub trait NodeDelegate {
                         body: MessageBody {
                             msg_id: None,
                             in_reply_to: None,
-                            local_msg: Some(LocalMessage::Cancel(reply_id, dest)),
+                            local_msg: Some(LocalMessage {
+                                msg_id: reply_id,
+                                node_id: dest,
+                                msg_type: LocalMessageType::Cancel,
+                            }),
                             contents: Self::MessageType::default(),
                         },
                     });
@@ -648,7 +650,11 @@ mod tests {
             .insert((1.into(), "".into()));
 
         if let Err(e) = delegate
-            .handle_local_message(LocalMessage::Cancel(1.into(), "".into()))
+            .handle_local_message(LocalMessage {
+                msg_id: 1.into(),
+                node_id: "".into(),
+                msg_type: LocalMessageType::Cancel,
+            })
             .await
         {
             panic!("Got error: {}", e);

@@ -3,13 +3,15 @@ use std::{
     future::Future,
     marker::PhantomData,
     ops::Deref,
+    time::Duration,
 };
 
 use log::{error, info, warn};
 use maelstrom_csp::{
     get_node_and_io,
     message::{
-        ErrorMessagePayload, InitMessagePayload, LocalMessage, Message, MessageId, MessagePayload,
+        ErrorMessagePayload, InitMessagePayload, LocalMessage, LocalMessageType, Message,
+        MessageBody, MessageId, MessagePayload,
     },
     node::NodeDelegate,
     rpc_error::MaelstromError,
@@ -25,6 +27,7 @@ use message_macro::maelstrom_message;
 
 const BROADCAST_TIMEOUT_MS: u64 = 1000;
 const BRANCHING_FACTOR: u64 = 4;
+const BUFFER_TIMEOUT_MS: u64 = 500;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 struct BroadcastPayload {
@@ -55,6 +58,12 @@ enum ChallengePayload {
     #[serde(rename = "broadcast_ok")]
     BroadcastOk,
 
+    #[serde(rename = "peer_broadcast")]
+    PeerBroadcast(AllMessagePayload),
+
+    #[serde(rename = "peer_broadcast_ok")]
+    PeerBroadcastOk,
+
     #[serde(rename = "read")]
     Read,
 
@@ -67,10 +76,10 @@ enum ChallengePayload {
     #[serde(rename = "topology_ok")]
     TopologyOk,
 
-    #[serde(rename = "state")]
+    #[serde(rename = "all_messages")]
     AllMessages(AllMessagePayload),
 
-    #[serde(rename = "state_ok")]
+    #[serde(rename = "all_messages_ok")]
     AllMessagesOk,
 }
 
@@ -82,16 +91,26 @@ type ChallengeMessage = Message<ChallengePayload>;
 // requests and responses (so no multiple outstanding messages) or require a combinatorial explosion of states modeling
 // all possible combinations of outstanding messages up to some arbitrary bound, neither of which is practical.
 trait NeighborHealth {}
+
+#[derive(Debug)]
 struct Healthy {}
+
+#[derive(Debug)]
 struct Unhealthy {}
 
 impl NeighborHealth for Healthy {}
 impl NeighborHealth for Unhealthy {}
 
-trait StateManager {
+trait StateManager: std::fmt::Debug {
     fn accept_broadcast(
         self: Box<Self>,
         msg: &BroadcastPayload,
+    ) -> (Box<dyn StateManager + Send + 'static>, Command);
+
+    fn accept_peer_broadcast(
+        self: Box<Self>,
+        msg: &AllMessagePayload,
+        is_from_me: bool,
     ) -> (Box<dyn StateManager + Send + 'static>, Command);
 
     fn accept_timeout(
@@ -99,12 +118,12 @@ trait StateManager {
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command);
 
-    fn accept_broadcast_timeout(
+    fn accept_peer_broadcast_timeout(
         self: Box<Self>,
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command);
 
-    fn accept_state_timeout(
+    fn accept_all_messages_timeout(
         self: Box<Self>,
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command);
@@ -114,23 +133,36 @@ trait StateManager {
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command);
 
-    fn accept_state(
+    fn accept_all_messages(
         self: Box<Self>,
         msg: &AllMessagePayload,
+        is_from_me: bool,
     ) -> (Box<dyn StateManager + Send + 'static>, Command);
 
-    fn accept_state_ok(
+    fn accept_all_messages_ok(
         self: Box<Self>,
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command);
 
+    fn send_anyway(&mut self, msg_id: MessageId) -> Command;
+
     fn acked(&self, message: i64) -> bool;
 }
 
+#[derive(Debug)]
+enum Command {
+    Broadcast(MessageId, Vec<i64>),
+    AwaitNext(MessageId),
+    AllMessages(MessageId, Vec<i64>),
+    RestEasy,
+}
+
+#[derive(Debug)]
 struct NeighborState<S: NeighborHealth> {
-    pending: BTreeMap<MessageId, i64>,
+    buffered: Option<(MessageId, i64)>,
+    pending: BTreeMap<MessageId, Vec<i64>>,
     pending_all_msgs: Option<Vec<i64>>,
-    retry_contents: Option<(MessageId, i64)>,
+    retry_contents: Option<(MessageId, Vec<i64>)>,
     backlog: HashSet<i64>,
     acked: HashSet<i64>,
     // Message IDs are now unique per destination, not globally for this node, and they're reused for retries. The
@@ -143,19 +175,13 @@ struct NeighborState<S: NeighborHealth> {
     _marker: PhantomData<S>,
 }
 
-#[derive(Debug)]
-enum Command {
-    Broadcast(MessageId, i64),
-    AllMessages(MessageId, Vec<i64>),
-    RestEasy,
-}
-
-impl<S: NeighborHealth + Send + 'static> NeighborState<S>
+impl<S: NeighborHealth + Send + std::fmt::Debug + 'static> NeighborState<S>
 where
     NeighborState<S>: StateManager,
 {
     fn new() -> Self {
         Self {
+            buffered: None,
             pending: BTreeMap::new(),
             pending_all_msgs: None,
             retry_contents: None,
@@ -178,9 +204,9 @@ where
         if self.pending.contains_key(&msg_id)
             || (self.retry_contents.is_some() && self.retry_contents.as_ref().unwrap().0 == msg_id)
         {
-            self.accept_broadcast_timeout(msg_id)
+            self.accept_peer_broadcast_timeout(msg_id)
         } else if self.pending_all_msgs.is_some() {
-            self.accept_state_timeout(msg_id)
+            self.accept_all_messages_timeout(msg_id)
         } else {
             // We're not cancelling timeouts, so we'll get a spurious one after successful ack from the other node.
             info!("Ignoring stale timeout for msg_id: {:?}", msg_id);
@@ -199,10 +225,42 @@ impl StateManager for NeighborState<Healthy> {
             return (self, Command::RestEasy);
         }
 
-        let msg_id = self.next_msg_id();
-        self.pending.insert(msg_id, msg.message);
+        if let Some((msg_id, buffered)) = self.buffered {
+            let messages = vec![buffered, msg.message];
+            self.pending.insert(msg_id, messages.clone());
+            self.buffered.take();
 
-        (self, Command::Broadcast(msg_id, msg.message))
+            return (self, Command::Broadcast(msg_id, messages));
+        }
+        let msg_id = self.next_msg_id();
+        let _ = self.buffered.insert((msg_id, msg.message));
+        info!(
+            "Stashing away buffered message with id {}: {:?}",
+            msg_id, msg.message
+        );
+
+        (self, Command::AwaitNext(msg_id))
+    }
+
+    fn accept_peer_broadcast(
+        mut self: Box<Self>,
+        msg: &AllMessagePayload,
+        is_from_me: bool,
+    ) -> (Box<dyn StateManager + Send + 'static>, Command) {
+        if is_from_me {
+            self.acked.extend(msg.messages.iter());
+            return (self, Command::RestEasy);
+        }
+
+        // Got a broadcast from someone else, gossip about it with this node if it hasn't seen it before.
+        if msg.messages.iter().all(|m| self.acked(*m)) {
+            return (self, Command::RestEasy);
+        }
+
+        let msg_id = self.next_msg_id();
+        self.pending.insert(msg_id, msg.messages.clone());
+
+        (self, Command::Broadcast(msg_id, msg.messages.clone()))
     }
 
     fn accept_timeout(
@@ -212,70 +270,79 @@ impl StateManager for NeighborState<Healthy> {
         self.accept_timeout_impl(msg_id)
     }
 
-    fn accept_broadcast_timeout(
+    fn accept_peer_broadcast_timeout(
         mut self: Box<Self>,
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // Our last broadcast timed out. Transition to unhealthy, put everything not acked in the backlog, resend as a
         // heartbeat.
-        let message = self.pending.remove(&msg_id).unwrap();
+        let messages = self.pending.remove(&msg_id).unwrap();
         let mut backlog: HashSet<i64> = HashSet::new();
-        backlog.extend(self.pending.values());
+        backlog.extend(self.pending.values().flatten());
+        if let Some((_, buffered)) = self.buffered.take() {
+            backlog.insert(buffered);
+        }
 
         // A possible ordering of incoming messages is that we get this timeout after having sent a state message,
         // so make sure to save this too.
         backlog.extend(self.pending_all_msgs.unwrap_or_default());
 
         let next_state: NeighborState<Unhealthy> = NeighborState {
+            buffered: None,
             pending: BTreeMap::new(),
             pending_all_msgs: None,
-            retry_contents: Some((msg_id, message)),
+            retry_contents: Some((msg_id, messages.clone())),
             backlog,
             acked: self.acked,
             msg_id: self.msg_id,
             _marker: PhantomData,
         };
 
-        (Box::new(next_state), Command::Broadcast(msg_id, message))
+        (Box::new(next_state), Command::Broadcast(msg_id, messages))
     }
 
-    fn accept_state_timeout(
+    fn accept_all_messages_timeout(
         mut self: Box<Self>,
         _: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
-        // This node was briefly healthy, but our state message timed out. Transition to unhealthy and pick out a value
-        // to send as a heartbeat.
+        // This node was briefly healthy, but our all-messages message timed out. Transition to unhealthy and pick out a
+        // value to send as a heartbeat.
         let mut all_msg_contents = self.pending_all_msgs.take().unwrap();
         let mut backlog: HashSet<i64> = HashSet::new();
 
         let msg_id: MessageId;
-        let message: i64;
+        let messages: Vec<i64>;
         if !self.pending.is_empty() {
             // Nominate one of these pending messages to be the heartbeat while this node is unhealthy.
-            (msg_id, message) = self.pending.pop_first().unwrap();
+            (msg_id, messages) = self.pending.pop_first().unwrap();
 
             // In case broadcasts were sent while this node was healthy but waiting to get a AllMessagesOk response.
-            backlog.extend(self.pending.values());
+            backlog.extend(self.pending.values().flatten());
         } else {
-            // Nominate one of the values from the state we tried to send out as the heartbeat.
+            // Nominate one of the values from the all-messages message we tried to send out as the heartbeat.
             msg_id = self.next_msg_id();
-            message = all_msg_contents
+            messages = vec![all_msg_contents
                 .pop()
-                .expect("State we sent out was empty, so it shouldn't have been sent");
+                .expect("State we sent out was empty, so it shouldn't have been sent")];
+        }
+
+        if let Some((_, buffered)) = self.buffered.take() {
+            backlog.insert(buffered);
         }
         backlog.extend(all_msg_contents);
 
         let next_state: NeighborState<Unhealthy> = NeighborState {
+            buffered: None,
             pending: BTreeMap::new(),
             pending_all_msgs: None,
-            retry_contents: Some((msg_id, message)),
+            retry_contents: Some((msg_id, messages.clone())),
             backlog,
             acked: self.acked,
             msg_id: self.msg_id,
             _marker: PhantomData,
         };
 
-        (Box::new(next_state), Command::Broadcast(msg_id, message))
+        (Box::new(next_state), Command::Broadcast(msg_id, messages))
     }
 
     fn accept_broadcast_ok(
@@ -283,17 +350,23 @@ impl StateManager for NeighborState<Healthy> {
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // Our broadcast got acked, make note of that and move on.
-        let message = self.pending.remove(&msg_id).unwrap();
-        self.acked.insert(message);
+        let messages = self.pending.remove(&msg_id).unwrap_or_default();
+        self.acked.extend(messages);
 
         (self, Command::RestEasy)
     }
 
-    fn accept_state(
+    fn accept_all_messages(
         mut self: Box<Self>,
         msg: &AllMessagePayload,
+        is_from_me: bool,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
-        // We got a state message from someone else, gossip about it to this node if there's anything it hasn't seen.
+        if is_from_me {
+            self.acked.extend(msg.messages.iter());
+            return (self, Command::RestEasy);
+        }
+
+        // We got an all-messages from someone else, gossip about it to this node if there's anything it hasn't seen.
         if msg
             .messages
             .iter()
@@ -310,15 +383,29 @@ impl StateManager for NeighborState<Healthy> {
         (self, Command::AllMessages(msg_id, msg.messages.clone()))
     }
 
-    fn accept_state_ok(
+    fn accept_all_messages_ok(
         mut self: Box<Self>,
         _: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
-        // Our state message got acked, make note of that and move on.
-        let messages = self.pending_all_msgs.take().unwrap();
+        // Our all-messages message got acked, make note of that and move on.
+        let messages = self.pending_all_msgs.take().unwrap_or_default();
         self.acked.extend(messages);
 
         (self, Command::RestEasy)
+    }
+
+    fn send_anyway(&mut self, msg_id: MessageId) -> Command {
+        if let Some((buffered_msg_id, buffered)) = self.buffered {
+            if msg_id == buffered_msg_id {
+                let messages = vec![buffered];
+                self.pending.insert(msg_id, messages.clone());
+                self.buffered.take();
+
+                return Command::Broadcast(buffered_msg_id, messages);
+            }
+        }
+
+        Command::RestEasy
     }
 
     fn acked(&self, message: i64) -> bool {
@@ -341,6 +428,26 @@ impl StateManager for NeighborState<Unhealthy> {
         (self, Command::RestEasy)
     }
 
+    fn accept_peer_broadcast(
+        mut self: Box<Self>,
+        msg: &AllMessagePayload,
+        is_from_me: bool,
+    ) -> (Box<dyn StateManager + Send + 'static>, Command) {
+        if is_from_me {
+            self.acked.extend(msg.messages.iter());
+            return self.accept_broadcast_ok(0.into());
+        }
+
+        // Got a peer broadcast from someone else while this node was unhealthy. Add it to the backlog and move on.
+        if msg.messages.iter().all(|m| self.acked(*m)) {
+            return (self, Command::RestEasy);
+        }
+
+        self.backlog.extend(msg.messages.clone());
+
+        (self, Command::RestEasy)
+    }
+
     fn accept_timeout(
         self: Box<Self>,
         msg_id: MessageId,
@@ -348,14 +455,14 @@ impl StateManager for NeighborState<Unhealthy> {
         self.accept_timeout_impl(msg_id)
     }
 
-    fn accept_broadcast_timeout(
+    fn accept_peer_broadcast_timeout(
         self: Box<Self>,
         msg_id: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
         // Our heartbeat to this node timed out. Resend.
-        let (retry_msg_id, retry_message) = self.retry_contents.as_ref().unwrap();
+        let (retry_msg_id, retry_messages) = self.retry_contents.as_ref().unwrap();
         let command = if msg_id == *retry_msg_id {
-            Command::Broadcast(msg_id, *retry_message)
+            Command::Broadcast(msg_id, retry_messages.clone())
         } else {
             Command::RestEasy
         };
@@ -363,24 +470,28 @@ impl StateManager for NeighborState<Unhealthy> {
         (self, command)
     }
 
-    fn accept_state_timeout(
+    fn accept_all_messages_timeout(
         self: Box<Self>,
         _: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
-        // An unlikely possibility, but if a node has transitioned from unhealthy to healthy, sent a state message,
-        // then sent a broadcast very soon after while it was healthy but the state response was pending, those timeout
-        // tasks could conceivably be interleaved on different executor threads in such a way that the broadcast timeout
-        // gets acked first and transitions this node back to unhealthy before we get notified that the state message
-        // timed out. In any case, we saved the pending state to the backlog during that transition, so do nothing here.
+        // An unlikely possibility, but if a node has transitioned from unhealthy to healthy, sent an all-messages
+        // message, then sent a broadcast very soon after while it was healthy but the state response was pending, those
+        // timeout tasks could conceivably be interleaved on different executor threads in such a way that the broadcast
+        // timeout gets acked first and transitions this node back to unhealthy before we get notified that the state
+        // message timed out. In any case, we saved the pending state to the backlog during that transition, so do
+        // nothing here.
         (self, Command::RestEasy)
     }
 
     fn accept_broadcast_ok(
         mut self: Box<Self>,
-        msg_id: MessageId,
+        _: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
-        // Our heartbeat was acked! Transition back to healthy and send a state catchup message out.
-        let all_msg_contents: Vec<i64> = self.backlog.into_iter().collect();
+        // Our heartbeat was acked! Transition back to healthy and send a all-messages catchup message out.
+        let msg_id = self.next_msg_id();
+        let mut all_msg_contents: Vec<i64> = self.backlog.into_iter().collect();
+        all_msg_contents.extend(self.retry_contents.unwrap_or((0.into(), vec![])).1);
+
         let command = if !all_msg_contents.is_empty() {
             let _ = self.pending_all_msgs.insert(all_msg_contents.clone());
             Command::AllMessages(msg_id, all_msg_contents)
@@ -389,6 +500,7 @@ impl StateManager for NeighborState<Unhealthy> {
         };
 
         let new: NeighborState<Healthy> = NeighborState {
+            buffered: None,
             pending: BTreeMap::new(),
             pending_all_msgs: self.pending_all_msgs,
             retry_contents: None,
@@ -401,12 +513,18 @@ impl StateManager for NeighborState<Unhealthy> {
         (Box::new(new), command)
     }
 
-    fn accept_state(
+    fn accept_all_messages(
         mut self: Box<Self>,
         msg: &AllMessagePayload,
+        is_from_me: bool,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
-        // We got a state update from someone else while this node was unhealthy. Add it to the backlog and move on, the
-        // heartbeat we're sending will take care of things when this node comes back online.
+        if is_from_me {
+            self.acked.extend(msg.messages.iter());
+            return self.accept_broadcast_ok(0.into());
+        }
+
+        // We got an all-messages update from someone else while this node was unhealthy. Add it to the backlog and move
+        // on, the heartbeat we're sending will take care of things when this node comes back online.
         if msg
             .messages
             .iter()
@@ -421,17 +539,21 @@ impl StateManager for NeighborState<Unhealthy> {
         (self, Command::RestEasy)
     }
 
-    fn accept_state_ok(
+    fn accept_all_messages_ok(
         self: Box<Self>,
         _: MessageId,
     ) -> (Box<dyn StateManager + Send + 'static>, Command) {
-        // Basically the same situation as accept_state_timeout: if we send out a state message and then a broadcast in
-        // quick succession, and the state response just barely squeaks through before the timeout but the broadcast
-        // times out right after, an interleaving where the broadcast timeout notification appears on our queue first is
-        // conceivable. We'll take advantage of the idempotency of broadcast/state RPCs here and the unlikelihood of
-        // this event to simplify our bookkeeping and just stay unhealthy and keep all those messages in the backlog, to
-        // be resent when this node becomes healthy again.
+        // Basically the same situation as accept_all_messages_timeout: if we send out an all-messages message, then a
+        // broadcast in quick succession, and the all-messages response just barely squeaks through before the timeout
+        // but the broadcast times out right after, an interleaving where the broadcast timeout notification appears on
+        // our queue first is conceivable. We'll take advantage of the idempotency of broadcast/all-message RPCs here
+        // and the unlikelihood of this event to simplify our bookkeeping and just stay unhealthy and keep all those
+        // messages in the backlog, to be resent when this node becomes healthy again.
         (self, Command::RestEasy)
+    }
+
+    fn send_anyway(&mut self, _: MessageId) -> Command {
+        Command::RestEasy
     }
 
     fn acked(&self, message: i64) -> bool {
@@ -439,6 +561,7 @@ impl StateManager for NeighborState<Unhealthy> {
     }
 }
 
+#[derive(Debug)]
 struct Neighbor {
     neighbor_state: Option<Box<dyn StateManager + Send>>,
     node_id: String,
@@ -557,15 +680,19 @@ impl Neighbor {
 
     fn accept_message(&mut self, msg: &ChallengeMessage) -> Command {
         let neighbor_state = self.neighbor_state.take().unwrap();
+        let is_from_me = msg.src.as_ref().unwrap() == self.node_id();
 
         let (state, command) = match &msg.body.contents {
             ChallengePayload::Broadcast(b) => neighbor_state.accept_broadcast(b),
-            ChallengePayload::BroadcastOk => {
+            ChallengePayload::PeerBroadcast(b) => {
+                neighbor_state.accept_peer_broadcast(b, is_from_me)
+            }
+            ChallengePayload::PeerBroadcastOk => {
                 neighbor_state.accept_broadcast_ok(msg.body.in_reply_to.unwrap())
             }
-            ChallengePayload::AllMessages(s) => neighbor_state.accept_state(s),
+            ChallengePayload::AllMessages(s) => neighbor_state.accept_all_messages(s, is_from_me),
             ChallengePayload::AllMessagesOk => {
-                neighbor_state.accept_state_ok(msg.body.in_reply_to.unwrap())
+                neighbor_state.accept_all_messages_ok(msg.body.in_reply_to.unwrap())
             }
 
             // We shouldn't be getting any other variant here.
@@ -582,6 +709,12 @@ impl Neighbor {
         let neighbor_state = self.neighbor_state.take().unwrap();
         let (state, command) = neighbor_state.accept_timeout(msg_id);
         let _ = self.neighbor_state.insert(state);
+
+        command
+    }
+
+    fn send_anyway(&mut self, msg_id: MessageId) -> Command {
+        let command = self.neighbor_state.as_mut().unwrap().send_anyway(msg_id);
 
         command
     }
@@ -605,6 +738,7 @@ impl<T: Topology + Send> Neighbors<T> {
             .iter()
             .map(|n| (n.clone(), Neighbor::new(n)))
             .collect();
+        info!("My neighbors are: {:?}", neighbors);
 
         Self {
             topology,
@@ -649,14 +783,39 @@ impl BroadcastDelegate {
 
     async fn run_command(&mut self, dest: String, command: Command) -> Result<(), MaelstromError> {
         match command {
-            Command::Broadcast(msg_id, message) => {
+            Command::Broadcast(msg_id, messages) => {
                 self.rpc_with_timeout_with_msg_id(
                     dest,
-                    ChallengePayload::Broadcast(BroadcastPayload { message }),
+                    ChallengePayload::PeerBroadcast(AllMessagePayload { messages }),
                     BROADCAST_TIMEOUT_MS,
                     msg_id,
                 )
                 .await?;
+            }
+            Command::AwaitNext(msg_id) => {
+                let msg_tx = self.get_self_tx();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(BUFFER_TIMEOUT_MS)).await;
+
+                    let r = msg_tx.send(Message {
+                        src: None,
+                        dest: None,
+                        body: MessageBody {
+                            msg_id: None,
+                            in_reply_to: None,
+                            local_msg: Some(LocalMessage {
+                                msg_id,
+                                node_id: dest.clone(),
+                                msg_type: LocalMessageType::Other("send_anyway".to_string()),
+                            }),
+                            contents: ChallengePayload::Empty,
+                        },
+                    });
+
+                    if let Err(e) = r {
+                        panic!("Message egress hung up: {}", e);
+                    }
+                });
             }
             Command::AllMessages(msg_id, messages) => {
                 self.rpc_with_timeout_with_msg_id(
@@ -717,6 +876,9 @@ impl NodeDelegate for BroadcastDelegate {
             match &reply.body.contents {
                 // Let the state machines for remote nodes handle this.
                 ChallengePayload::BroadcastOk => {
+                    defer_to_state_machine = true;
+                }
+                ChallengePayload::PeerBroadcastOk => {
                     defer_to_state_machine = true;
                 }
                 ChallengePayload::AllMessagesOk => {
@@ -786,6 +948,18 @@ impl NodeDelegate for BroadcastDelegate {
                         "Egress hung up: {}"
                     );
                 }
+                ChallengePayload::PeerBroadcast(b) => {
+                    if !b.messages.iter().all(|m| self.msg_store.contains(m)) {
+                        self.msg_store.extend(b.messages.iter());
+                        defer_to_state_machine = true;
+                    }
+
+                    send!(
+                        self.get_msg_tx(),
+                        self.reply(message.clone(), ChallengePayload::PeerBroadcastOk)?,
+                        "Egress hung up: {}"
+                    );
+                }
                 ChallengePayload::AllMessages(s) => {
                     if !s
                         .messages
@@ -795,6 +969,7 @@ impl NodeDelegate for BroadcastDelegate {
                         .is_empty()
                     {
                         // Rely on idempotence to be lazy here and not filter out the messages we've already seen.
+                        self.msg_store.extend(s.messages.iter());
                         defer_to_state_machine = true;
                     }
 
@@ -836,10 +1011,7 @@ impl NodeDelegate for BroadcastDelegate {
             if defer_to_state_machine {
                 let commands = self.run_state_machines(&message);
                 for (node_id, command) in commands.into_iter() {
-                    if &node_id != message.src.as_ref().unwrap() {
-                        // Don't talk back to the node we just heard from.
-                        self.run_command(node_id, command).await?;
-                    }
+                    self.run_command(node_id, command).await?;
                 }
             }
 
@@ -853,30 +1025,34 @@ impl NodeDelegate for BroadcastDelegate {
         msg: LocalMessage,
     ) -> impl Future<Output = Result<(), MaelstromError>> + Send {
         async move {
-            let (msg_id, node_id) = match &msg {
-                LocalMessage::Cancel(msg_id, node_id) => {
-                    if !self.outstanding_replies.remove(&(*msg_id, node_id.clone())) {
+            let node = self
+                .neighbors
+                .node_mut(&msg.node_id)
+                .ok_or(MaelstromError::Other(format!(
+                    "Couldn't find node in neighbors: {}",
+                    msg.node_id
+                )))?;
+            let command = match &msg.msg_type {
+                LocalMessageType::Cancel => {
+                    if !self
+                        .outstanding_replies
+                        .remove(&(msg.msg_id, msg.node_id.clone()))
+                    {
                         info!(
                             "Ignoring stale timeout for (msg_id, node_id) ({}, {})",
-                            msg_id, node_id
+                            msg.msg_id, msg.node_id
                         );
                     }
-                    (msg_id, node_id)
+
+                    node.accept_timeout(msg.msg_id)
+                }
+                LocalMessageType::Other(_) => {
+                    info!("Attempting send anyway to {}: {:?}", msg.node_id, msg);
+                    node.send_anyway(msg.msg_id)
                 }
             };
 
-            let command = {
-                let node = self
-                    .neighbors
-                    .node_mut(node_id)
-                    .ok_or(MaelstromError::Other(format!(
-                        "Couldn't find node in neighbors: {}",
-                        node_id
-                    )))?;
-
-                node.accept_timeout(*msg_id)
-            };
-            self.run_command(node_id.clone(), command).await?;
+            self.run_command(msg.node_id, command).await?;
 
             Ok(())
         }

@@ -68,8 +68,16 @@ pub trait MessagePayload: std::fmt::Debug + Default {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum LocalMessage {
-    Cancel(MessageId, String),
+pub enum LocalMessageType {
+    Cancel,
+    Other(String),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LocalMessage {
+    pub msg_id: MessageId,
+    pub node_id: String,
+    pub msg_type: LocalMessageType,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
