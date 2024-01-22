@@ -1,0 +1,16 @@
+[package]
+name = "challenge3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+maelstrom_csp = { path = "../maelstrom_csp" }
+message_macro = { path = "../message_macro" }
+
+anyhow = "^1.0.75"
+env_logger = "^0.10.1"
+futures = "^0.3.30"
+log = "^0.4.20"
+serde = { version = "^1.0.193", features = ["derive"] }
+serde_json = "^1.0.108"
+tokio = { version = "^1.35.1", features = ["rt-multi-thread"] }

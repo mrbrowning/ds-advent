@@ -172,6 +172,26 @@ pub trait NodeDelegate {
         Self::format_outgoing(dest, body)
     }
 
+    fn gen_reply(
+        request: Message<Self::MessageType>,
+        contents: Self::MessageType,
+    ) -> Result<Message<Self::MessageType>, MaelstromError> {
+        let in_reply_to = Some(request.body.msg_id.ok_or(MaelstromError::RPCError(
+            RPCError::new(
+                ErrorType::MalformedRequest.into(),
+                "Message body missing msg_id".to_string(),
+            ),
+        ))?);
+        let body = MessageBody {
+            msg_id: None,
+            in_reply_to,
+            local_msg: None,
+            contents,
+        };
+
+        Ok(Self::format_outgoing(request.src, body))
+    }
+
     fn reply(
         &self,
         request: Message<Self::MessageType>,

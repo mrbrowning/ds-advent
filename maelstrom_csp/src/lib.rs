@@ -7,6 +7,7 @@ use tokio::{
 use crate::node::UninitializedNode;
 
 pub mod io;
+pub mod kv;
 pub mod message;
 pub mod node;
 pub mod rpc_error;
