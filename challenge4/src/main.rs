@@ -1,24 +1,21 @@
-use std::{
-    cmp::max,
-    collections::{HashMap, HashSet},
-};
+use std::collections::HashMap;
 
 use log::error;
-use maelstrom_csp::{
+use maelstrom_csp2::{
     get_node_and_io,
-    kv::{KvCasPayload, KvMessageExt, KvReadPayload, KvType, KvWritePayload},
+    kv::{KvCasPayload, KvReadPayload, KvType, KvWritePayload},
     message::{
-        ErrorCode, ErrorMessagePayload, InitMessagePayload, Message, MessageBody, MessageId,
-        MessagePayload,
+        ErrorMessagePayload, InitMessagePayload, Message, MessageId, MessagePayload, ParsedInput,
+        ParsedMessage, ParsedRpc,
     },
-    node::NodeDelegate,
+    node::{Command, NodeDelegate, NodeInput, ReplyRecord},
     rpc_error::{ErrorType, MaelstromError},
     send,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{stdin, stdout, BufReader},
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
 };
 
 use message_macro::maelstrom_message;
@@ -64,371 +61,47 @@ enum ChallengePayload {
     KvCasOk,
 }
 
-impl KvMessageExt for ChallengePayload {
-    type Value = i64;
-
-    fn to_read_message(
-        key: &str,
-        msg_id: MessageId,
-        kv_type: maelstrom_csp::kv::KvType,
-    ) -> Message<Self> {
-        Message {
-            src: None,
-            dest: Some(format!("{}", kv_type)),
-            body: MessageBody {
-                msg_id: Some(msg_id),
-                in_reply_to: None,
-                local_msg: None,
-                contents: ChallengePayload::Read(KvReadPayload {
-                    key: Some(key.to_string()),
-                }),
-            },
-        }
-    }
-
-    fn to_write_message(
-        key: &str,
-        value: i64,
-        msg_id: MessageId,
-        kv_type: maelstrom_csp::kv::KvType,
-    ) -> Message<Self> {
-        Message {
-            src: None,
-            dest: Some(format!("{}", kv_type)),
-            body: MessageBody {
-                msg_id: Some(msg_id),
-                in_reply_to: None,
-                local_msg: None,
-                contents: ChallengePayload::KvWrite(KvWritePayload {
-                    key: key.to_string(),
-                    value,
-                }),
-            },
-        }
-    }
-
-    fn to_cas_message(
-        key: &str,
-        from: i64,
-        to: i64,
-        create_if_not_exists: bool,
-        msg_id: MessageId,
-        kv_type: maelstrom_csp::kv::KvType,
-    ) -> Message<Self> {
-        Message {
-            src: None,
-            dest: Some(format!("{}", kv_type)),
-            body: MessageBody {
-                msg_id: Some(msg_id),
-                in_reply_to: None,
-                local_msg: None,
-                contents: ChallengePayload::KvCas(KvCasPayload {
-                    key: key.to_string(),
-                    from,
-                    to,
-                    create_if_not_exists: Some(create_if_not_exists),
-                }),
-            },
-        }
-    }
-}
-
-type ChallengeMessage = Message<ChallengePayload>;
-
-#[derive(Debug)]
-enum RequestKind {
-    Read(Vec<i64>),
-    Cas(i64),
-    ReadForCas,
-}
-
-#[derive(Debug)]
-struct ReplyRecord {
-    request: ChallengeMessage,
-    request_kind: RequestKind,
+#[derive(Clone, Debug)]
+struct ChallengeCommand {
+    add: i64,
 }
 
 #[derive(Debug)]
 struct CounterDelegate {
     node_id: String,
-    node_ids: HashSet<String>,
+    node_ids: Box<[String]>,
 
     msg_tx: UnboundedSender<Message<ChallengePayload>>,
-    msg_rx: Option<UnboundedReceiver<Message<ChallengePayload>>>,
-    self_tx: UnboundedSender<Message<ChallengePayload>>,
+    msg_rx: Option<UnboundedReceiver<ParsedInput<ChallengePayload>>>,
+
+    cmd_tx: UnboundedSender<Command<ChallengePayload, ChallengeCommand>>,
+    cmd_rx: Option<UnboundedReceiver<Command<ChallengePayload, ChallengeCommand>>>,
 
     cached_counter: i64,
 
     msg_id: MessageId,
-    outstanding_replies: HashSet<(MessageId, String)>,
-    reply_records: HashMap<MessageId, ReplyRecord>,
+    reply_records: HashMap<MessageId, ReplyRecord<ChallengePayload, ChallengeCommand>>,
 }
 
 impl CounterDelegate {
-    fn quorum_value(&self, neighbor_values: &Vec<i64>) -> Option<i64> {
-        if neighbor_values.len() == self.node_ids.len() + 1 {
-            // We've heard from everyone including the KV store, or they've timed out and gotten a default value, so
-            // we can name a quorum value.
-            return neighbor_values.iter().max().copied();
-        }
-
-        None
-    }
-
-    fn handle_read_timeout(
-        &mut self,
-        msg_id: MessageId,
-        mut quorum: Vec<i64>,
-        request: ChallengeMessage,
-    ) -> Result<(), MaelstromError> {
-        let msg_tx = self.get_msg_tx();
-
-        quorum.push(self.cached_counter);
-        if let Some(value) = self.quorum_value(&quorum) {
-            // We got a timeout or an actual read from everyone, respond to the reader.
-            // except distinguish between neighbors and clients
-            self.cached_counter = value;
-            let reply = Self::gen_reply(
-                request,
-                ChallengePayload::ReadOk(ReadOkPayload {
-                    value: self.cached_counter,
-                }),
-            )?;
-
-            send!(msg_tx, reply, "Delegate egress hung up: {}");
-        } else {
-            // Whoever this is timed out, so substitute our maybe-stale value for its quorum read.
-            self.reply_records.insert(
-                msg_id,
-                ReplyRecord {
-                    request,
-                    request_kind: RequestKind::Read(quorum),
-                },
-            );
-        }
-
-        Ok(())
-    }
-
-    async fn handle_cas_timeout(
-        &mut self,
-        delta: i64,
-        request: ChallengeMessage,
-    ) -> Result<(), MaelstromError> {
-        let msg_id = self.next_msg_id();
-        let proposed_value = self.cached_counter + delta;
-
-        self.reply_records.insert(
-            msg_id,
-            ReplyRecord {
-                request,
-                request_kind: RequestKind::Cas(delta),
-            },
-        );
-        self.rpc_with_timeout_with_msg_id(
-            String::from(KvType::SeqKv),
-            ChallengePayload::KvCas(KvCasPayload {
-                key: COUNTER_KEY.into(),
-                from: self.cached_counter,
-                to: proposed_value,
-                create_if_not_exists: Some(true),
-            }),
-            KV_TIMEOUT_MS,
-            msg_id,
-        )
-        .await
-    }
-
-    async fn handle_cas_read_timeout(
-        &mut self,
-        request: ChallengeMessage,
-    ) -> Result<(), MaelstromError> {
-        let msg_id = self.next_msg_id();
-        self.reply_records.insert(
-            msg_id,
-            ReplyRecord {
-                request,
-                request_kind: RequestKind::ReadForCas,
-            },
-        );
-
-        self.rpc_with_timeout_with_msg_id(
-            String::from(KvType::SeqKv),
-            ChallengePayload::Read(KvReadPayload {
-                key: Some(COUNTER_KEY.into()),
-            }),
-            KV_TIMEOUT_MS,
-            msg_id,
-        )
-        .await
-    }
-
-    fn handle_quorum_read_ok(
-        &mut self,
-        msg_id: MessageId,
-        value: i64,
-        request: ChallengeMessage,
-        mut quorum: Vec<i64>,
-    ) -> Result<(), MaelstromError> {
-        let msg_tx = self.get_msg_tx();
-
-        quorum.push(value);
-        if let Some(value) = self.quorum_value(&quorum) {
-            // We got replies or timeouts from everyone in our quorum group, respond to the reader.
-            self.cached_counter = max(value, self.cached_counter);
-            let reply = Self::gen_reply(
-                request,
-                ChallengePayload::ReadOk(ReadOkPayload {
-                    value: self.cached_counter,
-                }),
-            )?;
-
-            send!(msg_tx, reply, "Delegate egress hung up: {}");
-        } else {
-            // We haven't heard from everybody yet, so wait on that.
-            self.reply_records.insert(
-                msg_id,
-                ReplyRecord {
-                    request,
-                    request_kind: RequestKind::Read(quorum),
-                },
-            );
-        }
-
-        Ok(())
-    }
-
-    async fn handle_cas_read_ok(
-        &mut self,
-        value: i64,
-        request: ChallengeMessage,
-    ) -> Result<(), MaelstromError> {
-        self.cached_counter = max(self.cached_counter, value);
-        let msg_id = self.next_msg_id();
-        let delta = match &request.body.contents {
-            ChallengePayload::Add(a) => a.delta,
-            _ => panic!("Unexpected message type in reply record: {:?}", request),
-        };
-        self.reply_records.insert(
-            msg_id,
-            ReplyRecord {
-                request,
-                request_kind: RequestKind::Cas(delta),
-            },
-        );
-
-        self.rpc_with_timeout_with_msg_id(
-            String::from(KvType::SeqKv),
-            ChallengePayload::KvCas(KvCasPayload {
-                key: COUNTER_KEY.into(),
-                from: self.cached_counter,
-                to: self.cached_counter + delta,
-                create_if_not_exists: None,
-            }),
-            KV_TIMEOUT_MS,
-            msg_id,
-        )
-        .await
-    }
-
-    fn handle_cas_ok(&mut self, request: ChallengeMessage) -> Result<(), MaelstromError> {
-        let msg_tx = self.get_msg_tx();
-        let delta = match &request.body.contents {
-            ChallengePayload::Add(payload) => payload.delta,
-            _ => panic!("Unexpected message type in reply record: {:?}", request),
-        };
-        self.cached_counter += delta;
-
-        let reply = Self::gen_reply(request, ChallengePayload::AddOk)?;
-        send!(msg_tx, reply, "Delegate egress hung up: {}");
-
-        Ok(())
-    }
-
-    async fn handle_cas_error(
-        &mut self,
-        error_code: ErrorCode,
-        request: ChallengeMessage,
-    ) -> Result<(), MaelstromError> {
-        let error_type = ErrorType::try_from(error_code)?;
-        match error_type {
-            ErrorType::KeyDoesNotExist => {
-                let reply = Self::gen_reply(
-                    request,
-                    ChallengePayload::ReadOk(ReadOkPayload {
-                        value: self.cached_counter,
-                    }),
-                )?;
-
-                let msg_tx = self.get_msg_tx();
-                send!(msg_tx, reply, "Delegate egress hung up: {}");
-
-                Ok(())
-            }
-            ErrorType::PreconditionFailed => {
-                let msg_id = self.next_msg_id();
-                self.reply_records.insert(
-                    msg_id,
-                    ReplyRecord {
-                        request,
-                        request_kind: RequestKind::ReadForCas,
-                    },
-                );
-
-                // Just avoid parsing the string and send out a read again.
-                self.rpc_with_timeout_with_msg_id(
-                    String::from(KvType::SeqKv),
-                    ChallengePayload::Read(KvReadPayload {
-                        key: Some(COUNTER_KEY.into()),
-                    }),
-                    KV_TIMEOUT_MS,
-                    msg_id,
-                )
-                .await
-            }
-            _ => panic!("Got error from kv store: {:?}", error_type),
-        }
-    }
-
     async fn handle_read_request(
         &mut self,
-        request: ChallengeMessage,
+        request: ParsedRpc<ChallengePayload>,
     ) -> Result<(), MaelstromError> {
-        if self.node_ids.contains(request.src.as_ref().unwrap()) {
+        if self.is_cluster_member(&request.src) {
             let msg_tx = self.get_msg_tx();
-            let reply = Self::gen_reply(
-                request,
+            let reply = self.reply(
+                request.src,
+                request.msg_id,
                 ChallengePayload::ReadOk(ReadOkPayload {
                     value: self.cached_counter,
                 }),
-            )?;
+            );
 
             send!(msg_tx, reply, "Delegate egress hung up: {}");
             return Ok(());
         }
 
-        let msg_id = self.next_msg_id();
-        self.reply_records.insert(
-            msg_id,
-            ReplyRecord {
-                request,
-                request_kind: RequestKind::Read(vec![]),
-            },
-        );
-
-        self.rpc_with_timeout_with_msg_id(
-            String::from(KvType::SeqKv),
-            ChallengePayload::Read(KvReadPayload {
-                key: Some(COUNTER_KEY.into()),
-            }),
-            KV_TIMEOUT_MS,
-            msg_id,
-        )
-        .await?;
-
-        // Probably not possible in general but it'd be wonderful if the borrow checker understood the split borrow
-        // happening here, with node_ids being able to be borrowed immutably for the iteration and not being referenced
-        // at all in the call chain emanating from the loop body.
         let node_ids: Vec<String> = self
             .node_ids
             .iter()
@@ -440,15 +113,84 @@ impl CounterDelegate {
                 }
             })
             .collect();
-        for id in node_ids {
-            self.rpc_with_timeout_with_msg_id(
-                id,
-                ChallengePayload::Read(KvReadPayload { key: None }),
-                KV_TIMEOUT_MS,
-                msg_id,
-            )
-            .await?;
-        }
+        let (task_tx, mut task_rx) =
+            unbounded_channel::<NodeInput<ChallengePayload, ChallengeCommand>>();
+        let cmd_tx = self.get_command_tx();
+        let counter_value = self.cached_counter;
+
+        tokio::spawn(async move {
+            cmd_tx
+                .send(Command::Rpc {
+                    dest: String::from(KvType::SeqKv),
+                    msg: ChallengePayload::Read(KvReadPayload {
+                        key: Some(COUNTER_KEY.into()),
+                    }),
+                    sink: task_tx.clone(),
+                    timeout_ms: Some(KV_TIMEOUT_MS),
+                    msg_id: None,
+                })
+                .expect("Node hung up on itself");
+
+            for id in node_ids.iter() {
+                cmd_tx
+                    .send(Command::Rpc {
+                        dest: id.clone(),
+                        msg: ChallengePayload::Read(KvReadPayload { key: None }),
+                        sink: task_tx.clone(),
+                        timeout_ms: Some(KV_TIMEOUT_MS),
+                        msg_id: None,
+                    })
+                    .expect("Node hung up on itself");
+            }
+
+            let mut votes: Vec<i64> = Vec::new();
+            while votes.len() < node_ids.len() + 1 {
+                let result = task_rx.recv().await.expect("Node hung up on itself");
+                match &result {
+                    NodeInput::Message(m) => {
+                        if let ParsedInput::Reply(r) = m {
+                            match &r.body {
+                                ChallengePayload::ReadOk(r) => {
+                                    votes.push(r.value);
+                                }
+                                ChallengePayload::Error(e) => {
+                                    let err = ErrorType::try_from(e.code).unwrap();
+                                    match err {
+                                        // We haven't written the counter yet. Just send them what
+                                        // we have.
+                                        ErrorType::KeyDoesNotExist => {
+                                            votes.push(counter_value);
+                                        }
+                                        _ => panic!("Unexpected error from peer: {:?}", result),
+                                    }
+                                }
+                                _ => panic!("Unexpected reply: {:?}", r.body),
+                            }
+                        }
+                    }
+                    NodeInput::Command(c) => {
+                        if let Command::Timeout(msg_id) = c {
+                            // Peer timed out, use our cached value in its place.
+                            votes.push(counter_value);
+
+                            cmd_tx
+                                .send(Command::Cancel(*msg_id))
+                                .expect("Node hung up on itself");
+                        }
+                    }
+                }
+            }
+
+            cmd_tx
+                .send(Command::Reply {
+                    dest: request.src,
+                    msg_id: request.msg_id,
+                    msg: ChallengePayload::ReadOk(ReadOkPayload {
+                        value: *votes.iter().max().unwrap(),
+                    }),
+                })
+                .unwrap();
+        });
 
         Ok(())
     }
@@ -456,164 +198,200 @@ impl CounterDelegate {
     async fn handle_add_request(
         &mut self,
         delta: i64,
-        request: ChallengeMessage,
+        request: ParsedRpc<ChallengePayload>,
     ) -> Result<(), MaelstromError> {
-        let msg_id = self.next_msg_id();
-        self.reply_records.insert(
-            msg_id,
-            ReplyRecord {
-                request,
-                request_kind: RequestKind::Cas(delta),
-            },
-        );
+        let counter_value = self.cached_counter;
+        let (task_tx, mut task_rx) =
+            unbounded_channel::<NodeInput<ChallengePayload, ChallengeCommand>>();
+        let cmd_tx = self.get_command_tx();
 
-        self.rpc_with_timeout_with_msg_id(
-            String::from(KvType::SeqKv),
-            ChallengePayload::KvCas(KvCasPayload {
-                key: COUNTER_KEY.into(),
-                from: self.cached_counter,
-                to: self.cached_counter + delta,
-                create_if_not_exists: Some(true),
-            }),
-            KV_TIMEOUT_MS,
-            msg_id,
-        )
-        .await
+        tokio::spawn(async move {
+            let mut cas_rpc = Command::Rpc {
+                dest: String::from(KvType::SeqKv),
+                msg: ChallengePayload::KvCas(KvCasPayload {
+                    key: COUNTER_KEY.into(),
+                    from: counter_value,
+                    to: counter_value + delta,
+                    create_if_not_exists: Some(true),
+                }),
+                sink: task_tx.clone(),
+                timeout_ms: Some(KV_TIMEOUT_MS),
+                msg_id: None,
+            };
+            cmd_tx
+                .send(cas_rpc.clone())
+                .expect("Node hung up on itself");
+
+            // If the CAS fails on compare, we issue a read to get the newer value and flip this
+            // boolean so that we can loop on retrying the read if it times out. Once we get it
+            // back, we switch back into sending a CAS and retrying until it doesn't time out
+            // anymore.
+            let mut waiting_on_cas = true;
+            while let Some(result) = task_rx.recv().await {
+                if waiting_on_cas {
+                    match result {
+                        NodeInput::Message(m) => {
+                            if let ParsedInput::Reply(r) = m {
+                                match r.body {
+                                    ChallengePayload::KvCasOk => {
+                                        // Send a command back to the node delegate to add the
+                                        // delta to our counter. That means our cached value could
+                                        // be out of sync with the value in the KV store for long
+                                        // parts of this node's run, but the CRDT-like semantics of
+                                        // a grow-only counter make that not a problem.
+                                        cmd_tx
+                                            .send(Command::Custom(ChallengeCommand { add: delta }))
+                                            .expect("Node hung up on itself");
+
+                                        cmd_tx
+                                            .send(Command::Reply {
+                                                dest: request.src,
+                                                msg_id: request.msg_id,
+                                                msg: ChallengePayload::AddOk,
+                                            })
+                                            .expect("Node hung up on itself");
+
+                                        break;
+                                    }
+                                    ChallengePayload::Error(e) => {
+                                        let err = ErrorType::try_from(e.code).unwrap();
+                                        match err {
+                                            ErrorType::PreconditionFailed => {
+                                                // The compare failed, so move to trying to read
+                                                // the current value from the KV store.
+                                                waiting_on_cas = false;
+                                                cmd_tx
+                                                    .send(Command::Rpc {
+                                                        dest: String::from(KvType::SeqKv),
+                                                        msg: ChallengePayload::Read(
+                                                            KvReadPayload {
+                                                                key: Some(COUNTER_KEY.into()),
+                                                            },
+                                                        ),
+                                                        sink: task_tx.clone(),
+                                                        timeout_ms: Some(KV_TIMEOUT_MS),
+                                                        msg_id: None,
+                                                    })
+                                                    .expect("Node hung up on itself");
+                                            }
+                                            _ => panic!("Got err from kv store: {:?}", err),
+                                        }
+                                    }
+                                    _ => panic!("Unexpected reply: {:?}", r.body),
+                                }
+                            }
+                        }
+                        NodeInput::Command(c) => {
+                            if let Command::Timeout(msg_id) = c {
+                                cmd_tx
+                                    .send(Command::Cancel(msg_id))
+                                    .expect("Node hung up on itself");
+
+                                // Retry the CAS.
+                                cmd_tx
+                                    .send(cas_rpc.clone())
+                                    .expect("Node hung up on itself");
+                            }
+                        }
+                    }
+                } else {
+                    // Issue a read to the KV store and retry until we get it.
+                    match result {
+                        NodeInput::Message(m) => {
+                            if let ParsedInput::Reply(r) = m {
+                                match r.body {
+                                    ChallengePayload::ReadOk(r) => {
+                                        cas_rpc = Command::Rpc {
+                                            dest: String::from(KvType::SeqKv),
+                                            msg: ChallengePayload::KvCas(KvCasPayload {
+                                                key: COUNTER_KEY.into(),
+                                                from: r.value,
+                                                to: r.value + delta,
+                                                create_if_not_exists: Some(true),
+                                            }),
+                                            sink: task_tx.clone(),
+                                            timeout_ms: Some(KV_TIMEOUT_MS),
+                                            msg_id: None,
+                                        };
+                                        cmd_tx
+                                            .send(cas_rpc.clone())
+                                            .expect("Node hung up on itself");
+
+                                        waiting_on_cas = true;
+                                    }
+                                    _ => panic!("Unexpected reply: {:?}", r.body),
+                                }
+                            }
+                        }
+                        NodeInput::Command(c) => {
+                            if let Command::Timeout(msg_id) = c {
+                                cmd_tx
+                                    .send(Command::Cancel(msg_id))
+                                    .expect("Node hung up on itself");
+
+                                // Retry timed out read.
+                                cmd_tx
+                                    .send(Command::Rpc {
+                                        dest: String::from(KvType::SeqKv),
+                                        msg: ChallengePayload::Read(KvReadPayload {
+                                            key: Some(COUNTER_KEY.into()),
+                                        }),
+                                        sink: task_tx.clone(),
+                                        timeout_ms: Some(KV_TIMEOUT_MS),
+                                        msg_id: None,
+                                    })
+                                    .expect("Node hung up on itself");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 }
 
-// TODO: the final request needs to be up to date, and we can't just rely on the kv store. Reads should fan out:
-// since the counter only ever grows, we know that the highest value is the most recent. During a partition, we should
-// still wait until the timeout and then return our best knowledge of what the current is. But so our read should
-// depend on everyone we're in contact with, and it should return the highest value seen. Whether from kv or neighbors.
-
 impl NodeDelegate for CounterDelegate {
     type MessageType = ChallengePayload;
+    type CommandType = ChallengeCommand;
 
     fn init(
-        node_id: impl AsRef<str>,
-        node_ids: impl AsRef<Vec<String>>,
+        node_id: String,
+        node_ids: impl IntoIterator<Item = String>,
         msg_tx: UnboundedSender<Message<Self::MessageType>>,
-        msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
-        self_tx: UnboundedSender<Message<Self::MessageType>>,
+        msg_rx: UnboundedReceiver<ParsedInput<Self::MessageType>>,
     ) -> Self {
+        let (cmd_tx, cmd_rx) = unbounded_channel::<Command<Self::MessageType, Self::CommandType>>();
+
         Self {
-            node_id: node_id.as_ref().into(),
-            node_ids: node_ids
-                .as_ref()
-                .clone()
-                .into_iter()
-                .filter(|id| id != node_id.as_ref())
-                .collect(),
+            node_id,
+            node_ids: node_ids.into_iter().collect(),
             msg_tx,
             msg_rx: Some(msg_rx),
-            self_tx,
+            cmd_tx,
+            cmd_rx: Some(cmd_rx),
             cached_counter: 0,
             msg_id: 0.into(),
-            outstanding_replies: HashSet::new(),
             reply_records: HashMap::new(),
-        }
-    }
-
-    fn get_outstanding_replies(&self) -> &HashSet<(MessageId, String)> {
-        &self.outstanding_replies
-    }
-
-    fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<(MessageId, String)> {
-        &mut self.outstanding_replies
-    }
-
-    #[allow(clippy::manual_async_fn)]
-    fn handle_local_message(
-        &mut self,
-        msg: maelstrom_csp::message::LocalMessage,
-    ) -> impl futures::prelude::Future<Output = Result<(), MaelstromError>> + Send {
-        async move {
-            match msg.msg_type {
-                maelstrom_csp::message::LocalMessageType::Cancel => {
-                    let reply_record = if let Some(record) = self.reply_records.remove(&msg.msg_id)
-                    {
-                        record
-                    } else {
-                        return Ok(());
-                    };
-
-                    match reply_record.request_kind {
-                        RequestKind::Read(v) => {
-                            // This was a quorum read to either a node or the kv store that timed out.
-                            self.handle_read_timeout(msg.msg_id, v, reply_record.request)
-                        }
-
-                        RequestKind::Cas(delta) => {
-                            // This was a CAS operation to the kv store that timed out.
-                            self.handle_cas_timeout(delta, reply_record.request).await
-                        }
-                        RequestKind::ReadForCas => {
-                            // This was a read, initiated by a failed CAS operation to the kv store, that timed out.
-                            self.handle_cas_read_timeout(reply_record.request).await
-                        }
-                    }
-                }
-                maelstrom_csp::message::LocalMessageType::Other(_) => unreachable!(),
-            }
-        }
-    }
-
-    #[allow(clippy::manual_async_fn)]
-    fn handle_reply(
-        &mut self,
-        reply: Message<Self::MessageType>,
-    ) -> impl futures::prelude::Future<Output = Result<(), MaelstromError>> + Send {
-        async move {
-            let reply_record =
-                if let Some(record) = self.reply_records.remove(&reply.body.in_reply_to.unwrap()) {
-                    record
-                } else {
-                    return Ok(());
-                };
-
-            match &reply.body.contents {
-                ChallengePayload::ReadOk(payload) => {
-                    match reply_record.request_kind {
-                        RequestKind::Read(quorum_reads) => {
-                            // This is a reply to a quorum read request we sent to either another node or our kv store.
-                            self.handle_quorum_read_ok(
-                                reply.body.in_reply_to.unwrap(),
-                                payload.value,
-                                reply_record.request,
-                                quorum_reads,
-                            )
-                        }
-                        RequestKind::ReadForCas => {
-                            // This is a reply to a read request initiated due to a failed CAS operation.
-                            self.handle_cas_read_ok(payload.value, reply_record.request)
-                                .await
-                        }
-                        RequestKind::Cas(_) => Err(MaelstromError::Other(format!(
-                            "Expected reply to cas from kv store in response to request {:?}",
-                            reply_record.request
-                        ))),
-                    }
-                }
-                ChallengePayload::KvCasOk => self.handle_cas_ok(reply_record.request),
-                ChallengePayload::Error(e) => {
-                    self.handle_cas_error(e.code, reply_record.request).await
-                }
-                _ => Err(MaelstromError::Other(format!(
-                    "Unexpected reply: {:?}",
-                    reply
-                ))),
-            }
         }
     }
 
     #[allow(clippy::manual_async_fn)]
     fn handle_message(
         &mut self,
-        message: Message<Self::MessageType>,
+        _: ParsedMessage<Self::MessageType>,
+    ) -> impl futures::prelude::Future<Output = Result<(), MaelstromError>> + Send {
+        async move { todo!() }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn handle_rpc(
+        &mut self,
+        message: ParsedRpc<Self::MessageType>,
     ) -> impl futures::prelude::Future<Output = Result<(), MaelstromError>> + Send {
         async move {
-            match &message.body.contents {
+            match &message.body {
                 ChallengePayload::Read(_) => self.handle_read_request(message).await,
                 ChallengePayload::Add(a) => self.handle_add_request(a.delta, message).await,
                 _ => Err(MaelstromError::Other(format!(
@@ -624,11 +402,25 @@ impl NodeDelegate for CounterDelegate {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
+    fn handle_custom_command(
+        &mut self,
+        command: Self::CommandType,
+    ) -> impl futures::prelude::Future<Output = Result<(), MaelstromError>> + Send {
+        async move {
+            self.cached_counter += command.add;
+
+            Ok(())
+        }
+    }
+
     fn get_msg_id(&mut self) -> &mut MessageId {
         &mut self.msg_id
     }
 
-    fn get_msg_rx(&mut self) -> UnboundedReceiver<Message<Self::MessageType>> {
+    fn get_msg_rx(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<ParsedInput<ChallengePayload>> {
         self.msg_rx.take().unwrap()
     }
 
@@ -636,8 +428,24 @@ impl NodeDelegate for CounterDelegate {
         self.msg_tx.clone()
     }
 
-    fn get_self_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
-        self.self_tx.clone()
+    fn get_reply_records_mut(
+        &mut self,
+    ) -> &mut HashMap<MessageId, ReplyRecord<Self::MessageType, Self::CommandType>> {
+        &mut self.reply_records
+    }
+
+    fn get_node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    fn get_command_rx(
+        &mut self,
+    ) -> UnboundedReceiver<Command<Self::MessageType, Self::CommandType>> {
+        self.cmd_rx.take().unwrap()
+    }
+
+    fn get_command_tx(&self) -> UnboundedSender<Command<Self::MessageType, Self::CommandType>> {
+        self.cmd_tx.clone()
     }
 }
 

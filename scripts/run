@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 
 set -euo pipefail
 
@@ -15,6 +15,8 @@ elif [ "$CHALLENGE" == "3" ] ; then
     maelstrom test -w broadcast --bin "$BIN_PATH" --node-count 25 --time-limit 20 --rate 100 --latency 100
 elif [ "$CHALLENGE" == "4" ] ; then
     maelstrom test -w g-counter --bin "$BIN_PATH" --node-count 3 --rate 100 --time-limit 20 --nemesis partition
+elif [ "$CHALLENGE" == "5" ] ; then
+    maelstrom test -w kafka --bin "$BIN_PATH" --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
 else
 	echo "Unknown challenge: $CHALLENGE"
 	exit 1
