@@ -81,36 +81,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
-name = "challenge0"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "futures",
- "log",
- "maelstrom_csp",
- "message_macro",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "challenge0_old"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "futures",
- "log",
- "maelstrom",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "challenge1"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "env_logger",
  "futures",
  "log",
@@ -125,7 +98,6 @@ dependencies = [
 name = "challenge1_old"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "env_logger",
  "futures",
  "log",
@@ -150,7 +122,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "challenge2_old"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "futures",
+ "log",
+ "maelstrom",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "challenge3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "futures",
+ "log",
+ "maelstrom_csp",
+ "message_macro",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "challenge4"
 version = "0.1.0"
 dependencies = [
  "anyhow",

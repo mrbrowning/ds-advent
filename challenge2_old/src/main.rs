@@ -1,17 +1,15 @@
-use std::{collections::HashSet, time::SystemTime};
+#![allow(clippy::all)]
 
-use log::error;
-use maelstrom_csp::{
-    message::{ErrorMessagePayload, InitMessagePayload, Message, MessageId, MessagePayload},
-    node::NodeDelegate,
-    rpc_error::MaelstromError,
-    send,
+use std::{
+    sync::{Arc, Mutex},
+    time::SystemTime,
 };
-use message_macro::maelstrom_message;
-use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{stdin, stdout, BufReader},
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+
+use futures::FutureExt;
+use log::error;
+use maelstrom::{
+    immediate,
+    node::{InitMessageBody, Message, Node},
 };
 
 const NODE_ID_BITS: i64 = 10;
@@ -22,19 +20,16 @@ const SEQUENCE_ID_CEILING: u64 = 1 << SEQUENCE_ID_BITS;
 
 const HIGH_ORDER_MASK: u64 = !(1 << 63);
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct GenerateOkPayload {
-    id: String,
-}
+macro_rules! unwrap {
+    ($value:expr, $msg:expr) => {{
+        let val = $value;
+        if val.is_err() {
+            error!($msg, val.err().unwrap());
+            return;
+        }
 
-#[maelstrom_message]
-#[derive(Serialize, Deserialize, Clone, Debug)]
-enum UniqueIdPayload {
-    #[serde(rename = "generate")]
-    Generate,
-
-    #[serde(rename = "generate_ok")]
-    GenerateOk(GenerateOkPayload),
+        val.unwrap()
+    }};
 }
 
 #[derive(Debug)]
@@ -125,139 +120,73 @@ fn get_node_id(node_name: impl AsRef<str>, node_list: &Vec<String>) -> Result<u1
     Ok(truncated)
 }
 
-struct UniqueIdDelegate {
-    msg_rx: Option<UnboundedReceiver<Message<UniqueIdPayload>>>,
-    msg_tx: UnboundedSender<Message<UniqueIdPayload>>,
-    self_tx: UnboundedSender<Message<UniqueIdPayload>>,
-
-    msg_id: MessageId,
-    outstanding_replies: HashSet<(MessageId, String)>,
-
-    generator: Generator,
-}
-
-impl NodeDelegate for UniqueIdDelegate {
-    type MessageType = UniqueIdPayload;
-
-    fn init(
-        node_id: impl AsRef<str>,
-        node_ids: impl AsRef<Vec<String>>,
-        msg_tx: UnboundedSender<Message<Self::MessageType>>,
-        msg_rx: UnboundedReceiver<Message<Self::MessageType>>,
-        self_tx: UnboundedSender<Message<Self::MessageType>>,
-    ) -> Self {
-        let generator_node_id = {
-            let generator_node_id = get_node_id(node_id, node_ids.as_ref());
-            if let Err(e) = generator_node_id {
-                panic!("Error in get_node_id: {}", e);
-            }
-
-            generator_node_id.unwrap()
-        };
-        let generator = {
-            let generator = Generator::new(generator_node_id, SystemTime::UNIX_EPOCH);
-            if let Err(e) = generator {
-                panic!("Failed to initialize generator: {}", e);
-            }
-
-            generator.unwrap()
-        };
-
-        Self {
-            msg_rx: Some(msg_rx),
-            msg_tx,
-            self_tx,
-            msg_id: 0.into(),
-            outstanding_replies: HashSet::new(),
-            generator,
-        }
-    }
-
-    fn get_outstanding_replies(&self) -> &HashSet<(MessageId, String)> {
-        &self.outstanding_replies
-    }
-
-    fn get_outstanding_replies_mut(&mut self) -> &mut HashSet<(MessageId, String)> {
-        &mut self.outstanding_replies
-    }
-
-    #[allow(clippy::manual_async_fn)]
-    fn handle_reply(
-        &mut self,
-        _: Message<Self::MessageType>,
-    ) -> impl std::future::Future<Output = Result<(), maelstrom_csp::rpc_error::MaelstromError>> + Send
-    {
-        async { Ok(()) }
-    }
-
-    #[allow(clippy::manual_async_fn)]
-    fn handle_message(
-        &mut self,
-        message: Message<Self::MessageType>,
-    ) -> impl std::future::Future<Output = Result<(), maelstrom_csp::rpc_error::MaelstromError>> + Send
-    {
-        async {
-            match message.body.contents {
-                UniqueIdPayload::Generate => (),
-                _ => return Ok(()),
-            };
-
-            let msg_tx = self.get_msg_tx();
-            let id = format!("{:016x}", self.generator.get_next_id());
-
-            let contents = UniqueIdPayload::GenerateOk(GenerateOkPayload { id });
-            send!(msg_tx, self.reply(message, contents)?, "Egress hung up: {}");
-
-            Ok(())
-        }
-    }
-
-    fn get_msg_id(&mut self) -> &mut MessageId {
-        &mut self.msg_id
-    }
-
-    fn get_msg_rx(&mut self) -> UnboundedReceiver<Message<Self::MessageType>> {
-        self.msg_rx.take().unwrap()
-    }
-
-    fn get_msg_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
-        self.msg_tx.clone()
-    }
-
-    fn get_self_tx(&self) -> UnboundedSender<Message<Self::MessageType>> {
-        self.self_tx.clone()
-    }
-}
-
 #[tokio::main]
 async fn main() {
     env_logger::init();
 
-    let (node, mut ingress, mut egress) = maelstrom_csp::get_node_and_io::<
-        UniqueIdPayload,
-        UniqueIdDelegate,
-    >(BufReader::new(stdin()), stdout());
+    let n = Node::default();
+    let msg_slot: Arc<Mutex<Option<Message>>> = Arc::new(Mutex::new(None));
+    let msg_slot_clone = msg_slot.clone();
+    n.handle(
+        "init",
+        Arc::new(move |_, msg| {
+            let mut msg_slot = msg_slot_clone.lock().expect("msg_slot lock poisoned");
+            let _ = msg_slot.insert(msg);
 
-    tokio::spawn(async move {
-        if let Err(e) = ingress.run().await {
-            panic!("Ingress died: {}", e);
-        }
-    });
-    tokio::spawn(async move {
-        if let Err(e) = egress.run().await {
-            panic!("Ingress died: {}", e);
-        }
-    });
+            immediate!(Ok(()))
+        }),
+    )
+    .await;
 
-    match node.run().await {
-        Err(e) => {
-            error!("Node init loop failed: {}", e);
+    let initialized = n.run_init().await;
+    if initialized.is_err() {
+        error!("Node init loop failed: {}", initialized.err().unwrap());
+        return;
+    }
+    let node = initialized.unwrap();
+
+    let init_message: Message = {
+        let mut lock = msg_slot.lock().expect("msg_slot lock poisoned");
+        if lock.is_none() {
+            error!("Failed to record init message");
+            return;
         }
-        Ok(initialized) => {
-            if let Err(e) = initialized.run().await {
-                error!("Node failed: {}", e);
-            }
-        }
+
+        lock.take().unwrap()
+    };
+    let body: InitMessageBody = unwrap!(
+        InitMessageBody::try_from(init_message.body),
+        "Failed to load init message from body: {}"
+    );
+    let node_id: u16 = unwrap!(
+        get_node_id(body.node_id, &body.node_ids),
+        "Failed to generate node id: {}"
+    );
+    let generator: Arc<Mutex<Generator>> = Arc::new(Mutex::new(unwrap!(
+        Generator::new(node_id, SystemTime::UNIX_EPOCH),
+        "Failed to initialize generator: {}"
+    )));
+
+    let generator_clone = generator.clone();
+    node.handle(
+        "generate",
+        Arc::new(move |node, msg| {
+            let mut body = msg.body.clone();
+            let mut generator = generator_clone.lock().expect("Generator lock was poisoned");
+            // The safest interpretation of JSON numbers is JavaScript semantics, with the biggest integer representable
+            // without loss of precision being 2^53, so unfortunately cast this to string.
+            let node_id = format!("{:016x}", generator.get_next_id());
+
+            body.insert("type".into(), serde_json::Value::from("generate_ok"));
+            body.insert("id".into(), serde_json::Value::from(node_id));
+
+            node.reply(msg, body).boxed()
+        }),
+    )
+    .await;
+
+    if let Err(e) = Node::run(Arc::new(node)).await {
+        error!("Node failed: {}", e);
     }
 }
 
@@ -351,7 +280,7 @@ mod tests {
         let sequence_mask: u64 = !((1 << 12) - 1);
         let mask = time_mask & sequence_mask;
 
-        assert_eq!(generator.get_next_id() & mask, 1023_u64 << 12);
+        assert_eq!(generator.get_next_id() & mask, (1023 as u64) << 12);
     }
 
     #[test]

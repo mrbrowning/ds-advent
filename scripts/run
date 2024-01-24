@@ -7,13 +7,13 @@ BIN_NAME="challenge${CHALLENGE}"
 BIN_PATH="target/release/${BIN_NAME}"
 
 cargo build -p "$BIN_NAME" --release
-if [ "$CHALLENGE" == "0" ] ; then
+if [ "$CHALLENGE" == "1" ] ; then
 	maelstrom test -w echo --bin "$BIN_PATH" --node-count 1 --time-limit 10
-elif [ "$CHALLENGE" == "1" ] ; then
-	maelstrom test -w unique-ids --bin "$BIN_PATH" --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
 elif [ "$CHALLENGE" == "2" ] ; then
-    maelstrom test -w broadcast --bin "$BIN_PATH" --node-count 25 --time-limit 20 --rate 100 --latency 100
+	maelstrom test -w unique-ids --bin "$BIN_PATH" --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
 elif [ "$CHALLENGE" == "3" ] ; then
+    maelstrom test -w broadcast --bin "$BIN_PATH" --node-count 25 --time-limit 20 --rate 100 --latency 100
+elif [ "$CHALLENGE" == "4" ] ; then
     maelstrom test -w g-counter --bin "$BIN_PATH" --node-count 3 --rate 100 --time-limit 20 --nemesis partition
 else
 	echo "Unknown challenge: $CHALLENGE"
