@@ -1,4 +1,4 @@
 [workspace]
 
-members = ["maelstrom", "maelstrom_csp", "maelstrom_csp2", "challenge1", "challenge2", "challenge3", "challenge4", "challenge5", "message_macro", "old_challenge1", "old_challenge2"]
+members = ["maelstrom", "maelstrom_csp", "maelstrom_csp2", "challenge1", "challenge2", "challenge3", "challenge4", "challenge5", "challenge6", "message_macro", "old_challenge1", "old_challenge2"]
 resolver = "2"

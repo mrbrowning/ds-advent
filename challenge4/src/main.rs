@@ -169,7 +169,7 @@ impl CounterDelegate {
                         }
                     }
                     NodeInput::Command(c) => {
-                        if let Command::Timeout(msg_id) = c {
+                        if let Command::Timeout(msg_id, _) = c {
                             // Peer timed out, use our cached value in its place.
                             votes.push(counter_value);
 
@@ -282,7 +282,7 @@ impl CounterDelegate {
                             }
                         }
                         NodeInput::Command(c) => {
-                            if let Command::Timeout(msg_id) = c {
+                            if let Command::Timeout(msg_id, _) = c {
                                 cmd_tx
                                     .send(Command::Cancel(msg_id))
                                     .expect("Node hung up on itself");
@@ -324,7 +324,7 @@ impl CounterDelegate {
                             }
                         }
                         NodeInput::Command(c) => {
-                            if let Command::Timeout(msg_id) = c {
+                            if let Command::Timeout(msg_id, _) = c {
                                 cmd_tx
                                     .send(Command::Cancel(msg_id))
                                     .expect("Node hung up on itself");

@@ -154,6 +154,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "challenge6"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "futures",
+ "log",
+ "maelstrom_csp2",
+ "message_macro",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "env_logger"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

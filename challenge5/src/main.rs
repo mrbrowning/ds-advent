@@ -23,7 +23,7 @@ use tokio::{
 
 use message_macro::maelstrom_message;
 
-const PEER_TIMEOUT_MS: u64 = 20000;
+const PEER_TIMEOUT_MS: u64 = 200;
 
 #[maelstrom_message]
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -25,7 +25,7 @@ pub type ReplyRecord<M, C> = (UnboundedSender<NodeInput<M, C>>, Option<JoinHandl
 
 #[derive(Clone, Debug)]
 pub enum Command<M: MessagePayload, C> {
-    Timeout(MessageId),
+    Timeout(MessageId, String),
     Cancel(MessageId),
     Send {
         dest: String,
@@ -166,7 +166,7 @@ pub trait NodeDelegate {
                 Command::Custom(c) => {
                     self.handle_custom_command(c).await?;
                 }
-                Command::Timeout(_) => (),
+                Command::Timeout(_, _) => (),
             };
 
             Ok(())
@@ -292,6 +292,7 @@ pub trait NodeDelegate {
             in_reply_to: None,
             contents,
         };
+        let dest_clone = dest.clone();
         let reply_record = (
             reply_sink.clone(),
             timeout_ms.map(move |t| {
@@ -301,7 +302,8 @@ pub trait NodeDelegate {
 
                     // If this failed, it's because this task didn't get aborted in time but the reply to this msg_id
                     // was successfully handled. Ignore the Err.
-                    let _ = reply_sink.send(NodeInput::Command(Command::Timeout(msg_id)));
+                    let _ =
+                        reply_sink.send(NodeInput::Command(Command::Timeout(msg_id, dest_clone)));
                 })
             }),
         );
